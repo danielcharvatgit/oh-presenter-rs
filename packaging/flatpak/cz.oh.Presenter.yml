@@ -1,0 +1,70 @@
+# Flatpak manifest. Build and install (see build.sh, or by hand):
+#   flatpak install flathub org.flatpak.Builder
+#   flatpak run org.flatpak.Builder --user --install --install-deps-from=flathub \
+#       --force-clean flatpak-build packaging/flatpak/cz.oh.Presenter.yml
+# After changing Cargo.lock run generate-cargo-sources.py.
+id: cz.oh.Presenter
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: oh-presenter-rs
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # network outputs (TCP + UDP broadcast on port 50200)
+  - --share=network
+  # the sound of videos (ffplay)
+  - --socket=pulseaudio
+  # services, songs, bibles and pictures anywhere in the home folder; the first start
+  # also looks there for files of the old oh-presenter
+  - --filesystem=home
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/oh-presenter-rs/cargo
+    CARGO_NET_OFFLINE: 'true'
+modules:
+  # ffmpeg plays the videos, ffplay their sound (the runtime has no ffmpeg programs).
+  # Only built-in decoders (H.264, HEVC, VP8/9, MPEG-2/4, AAC, MP3, Opus...); ffplay needs the SDK's SDL2.
+  - name: ffmpeg
+    config-opts:
+      - --enable-gpl
+      - --enable-shared
+      - --disable-static
+      - --disable-doc
+      - --disable-debug
+      - --disable-ffprobe
+      - --enable-ffplay
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /share/ffmpeg/examples
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-8.1.3.tar.xz
+        sha256: 7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+  - name: oh-presenter-rs
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --offline
+      - install -Dm755 target/release/oh-presenter-rs /app/bin/oh-presenter-rs
+      - install -Dm644 assets/icon.png /app/share/icons/hicolor/256x256/apps/cz.oh.Presenter.png
+      - install -Dm644 assets/icon-512.png /app/share/icons/hicolor/512x512/apps/cz.oh.Presenter.png
+      - install -Dm644 packaging/linux/oh-presenter-rs.desktop /app/share/applications/cz.oh.Presenter.desktop
+      - desktop-file-edit --set-icon=cz.oh.Presenter --set-key=StartupWMClass --set-value=cz.oh.Presenter
+        /app/share/applications/cz.oh.Presenter.desktop
+      - install -Dm644 packaging/flatpak/cz.oh.Presenter.metainfo.xml /app/share/metainfo/cz.oh.Presenter.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - flatpak-build
+          - flatpak-repo
+          - .flatpak-builder
+          - .git
+      - cargo-sources.json

@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=oh! Presenter
+GenericName=Presentation program
+GenericName[cs]=Prezentační program
+Comment=Songs, bible passages and slides on a projector
+Comment[cs]=Písně, biblické texty a snímky na projektor
+Exec=oh-presenter-rs
+Icon=oh-presenter-rs
+Terminal=false
+Categories=Office;Presentation;
+Keywords=church;songs;lyrics;bible;projector;slides;
+StartupWMClass=oh-presenter-rs
+Actions=Canvas;
+
+[Desktop Action Canvas]
+Name=Output window (network)
+Name[cs]=Výstupní okno (síť)
+Exec=oh-presenter-rs canvas
