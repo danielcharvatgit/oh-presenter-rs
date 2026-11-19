@@ -1,9 +1,52 @@
-#directories
-bower_components
-node_modules
-dist
-.idea
-
-#files
-*.tgz
+# notes and scratch files of the development
+/plan.txt
 *.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+*.swp
+*.swo
+
+# editors and tools
+.idea/
+.vscode/
+.fleet/
+.zed/
+.claude/
+*.iml
+.direnv/
+.envrc
+
+# operating systems
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Rust build output (also target/debian/*.deb and target/installer/*.exe)
+/target/
+
+# built packages and installers, wherever they end up
+# (they are published as GitHub release files, not committed)
+*.deb
+*.ddeb
+*.rpm
+*.exe
+*.msi
+*.msix
+*.AppImage
+*.flatpak
+*.flatpakref
+*.snap
+*.zip
+*.tar.gz
+*.tar.xz
+
+# flatpak build output
+/flatpak-build/
+/flatpak-repo/
+/.flatpak-builder/
+
+# ffmpeg.exe / ffplay.exe downloaded by packaging/windows/get-ffmpeg.ps1
+/packaging/windows/ffmpeg/

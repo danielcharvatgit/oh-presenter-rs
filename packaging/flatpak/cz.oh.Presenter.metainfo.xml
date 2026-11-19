@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>cz.oh.Presenter</id>
+  <name>oh! Presenter</name>
+  <summary>Songs, bible passages and slides on a projector</summary>
+  <summary xml:lang="cs">Písně, biblické texty a snímky na projektor</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      A presentation program for church services. It projects songs, bible passages and
+      designed slides on a local output window and on output windows on other computers
+      in the LAN.
+    </p>
+    <ul>
+      <li>Service order with songs, bible passages, designs, text and image slides and videos</li>
+      <li>Song library and editor with verse marks, verse order and text columns for more languages</li>
+      <li>Slide designer with text, shapes and images</li>
+      <li>Bible search by reference or by words, pinned passages</li>
+      <li>Import from OpenLP, OpenLyrics, ChordPro, Zefania, OSIS and OpenSong</li>
+      <li>Alerts running across the output, customisable keyboard shortcuts</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">cz.oh.Presenter.desktop</launchable>
+  <provides>
+    <binary>oh-presenter-rs</binary>
+  </provides>
+  <categories>
+    <category>Office</category>
+    <category>Presentation</category>
+  </categories>
+  <keywords>
+    <keyword>church</keyword>
+    <keyword>songs</keyword>
+    <keyword>lyrics</keyword>
+    <keyword>bible</keyword>
+    <keyword>projector</keyword>
+  </keywords>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-19"/>
+  </releases>
+</component>

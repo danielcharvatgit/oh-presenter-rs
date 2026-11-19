@@ -1,0 +1,49 @@
+[package]
+name = "oh-presenter-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Church presentation program: songs, bible passages, videos and designed slides, with output windows on the LAN"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/danielcharvatgit/oh-presenter-rs"
+build = "build.rs"
+
+[dependencies]
+base64 = "0.23.1"
+directories = "6.0.0"
+eframe = "0.37"
+# pure-Rust picture decoders; HEIC / HEIF / AVIF are converted to PNG with ffmpeg when added
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "tga", "pnm", "qoi", "dds", "hdr", "exr", "ff"] }
+rfd = "0.17.2"
+roxmltree = "0.21.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tar = "0.4.46"
+zip = "9.0.5"
+
+[build-dependencies]
+winresource = "0.1.34"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# `cargo deb` (cargo install cargo-deb) builds an Ubuntu/Debian package
+[package.metadata.deb]
+name = "oh-presenter-rs"
+maintainer = "oh! Presenter"
+section = "graphics"
+priority = "optional"
+depends = "$auto"
+# plays the videos (ffmpeg) and their sound (ffplay, in the same package)
+recommends = "ffmpeg"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Presents songs, bible passages, videos and designed slides on a local output window \
+and on output windows on other computers in the LAN."""
+assets = [
+    ["target/release/oh-presenter-rs", "usr/bin/", "755"],
+    ["packaging/linux/oh-presenter-rs.desktop", "usr/share/applications/", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/oh-presenter-rs.png", "644"],
+    ["assets/icon-512.png", "usr/share/icons/hicolor/512x512/apps/oh-presenter-rs.png", "644"],
+]
