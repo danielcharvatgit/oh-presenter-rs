@@ -15,6 +15,7 @@ pub struct ClientApp {
     textures: TextureCache,
     fullscreen: bool,
     alert: Option<(crate::model::Alert, std::time::Instant)>,
+    clock: crate::model::ClockStyle,
 }
 
 impl ClientApp {
@@ -27,12 +28,16 @@ impl ClientApp {
             textures: TextureCache::new(crate::storage::paths().client_media()),
             fullscreen: false,
             alert: None,
+            clock: Default::default(),
         }
     }
 }
 
 impl eframe::App for ClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !crate::start_guard::frame() {
+            ui.ctx().request_repaint();
+        }
         let ctx = ui.ctx().clone();
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
@@ -41,6 +46,7 @@ impl eframe::App for ClientApp {
                 ClientEvent::Scene(s) => self.scene = s,
                 ClientEvent::Asset(name) => self.textures.forget(&name),
                 ClientEvent::Alert(a) => self.alert = a.map(|a| (a, std::time::Instant::now())),
+                ClientEvent::Clock(c) => self.clock = c,
             }
         }
         let toggle = ctx.input(|i| i.key_pressed(Key::F11) || i.pointer.button_double_clicked(egui::PointerButton::Primary));
@@ -62,6 +68,8 @@ impl eframe::App for ClientApp {
                 self.alert = None;
             }
         }
+        // (repainted every 500 ms anyway, see below)
+        crate::clock::draw(&painter, rect, slide.width(), &self.clock, crate::clock::now_secs());
         if self.connected.is_none() {
             let text = t("client.searching");
             let pos = rect.right_bottom() - egui::vec2(16.0, 16.0);

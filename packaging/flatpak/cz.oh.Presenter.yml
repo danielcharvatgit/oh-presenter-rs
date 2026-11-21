@@ -67,4 +67,9 @@ modules:
           - flatpak-repo
           - .flatpak-builder
           - .git
+          - .mnm
+          # a bundle built earlier (build.sh --bundle) is not part of the sources
+          - oh-presenter-rs.flatpak
+          # the packages made by build.sh
+          - dist
       - cargo-sources.json

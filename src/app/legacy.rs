@@ -1,7 +1,7 @@
 //! Importing the files of the old oh-presenter (Electron): offered on the first run
 //! when such files are found, and any time from File → Import.
 
-use super::{App, Dialog, files};
+use super::{App, Dialog, FollowFocus, files};
 use crate::formats::{self, LegacyScan};
 use crate::i18n::{t, tf};
 use crate::model::*;
@@ -22,6 +22,20 @@ pub struct LegacyState {
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
+/// Saves a converted old presentation as a new `.ohsvc` next to the original or, where
+/// that folder cannot be written (a read-only USB stick, a file the flatpak only got
+/// through the file chooser portal), into the Documents folder.
+fn save_converted(original: &std::path::Path, service: &Service) -> Result<PathBuf, String> {
+    let next_to = storage::unique_path(&original.with_extension(formats::SERVICE_EXT));
+    let Err(first) = formats::save_service(&next_to, service) else { return Ok(next_to) };
+    let docs = directories::UserDirs::new().and_then(|u| u.document_dir().map(PathBuf::from)).or_else(home);
+    let Some(name) = next_to.file_name() else { return Err(first) };
+    let Some(dir) = docs else { return Err(first) };
+    let target = storage::unique_path(&dir.join(name));
+    formats::save_service(&target, service).map_err(|_| first)?;
+    Ok(target)
 }
 
 impl App {
@@ -105,7 +119,7 @@ impl App {
                     state.selected.iter_mut().for_each(|s| *s = false);
                 }
             });
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(260.0).show_following_focus(ui, |ui| {
                 for (f, sel) in state.scan.files.iter().zip(state.selected.iter_mut()) {
                     let kind = match f.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
                         Some("ohdata") => t("legacy.kind_songs"),
@@ -176,8 +190,7 @@ impl App {
                             _ => {}
                         }
                     }
-                    let target = storage::unique_path(&f.with_extension(formats::SERVICE_EXT));
-                    formats::save_service(&target, &service)?;
+                    let target = save_converted(&f, &service)?;
                     self.settings.add_recent(&target.to_string_lossy());
                     services.push(target);
                     Ok(())

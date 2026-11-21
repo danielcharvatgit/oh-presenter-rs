@@ -1,4 +1,4 @@
-use super::{App, Dialog, ItemRef};
+use super::{App, Dialog, FollowFocus, ItemRef};
 use crate::bible::{Bible, Bookmark, Hit};
 use crate::i18n::{current_language, t, tf};
 use crate::model::*;
@@ -19,33 +19,38 @@ impl App {
         let mut unpin = None;
         let mut changed = false;
         ui.heading(format!("📌 {}", t("bible.pins")));
-        egui::ScrollArea::vertical().id_salt("pins").max_height(ui.available_height() * 0.5).auto_shrink([false, true]).show(ui, |ui| {
-            if self.bible.bookmarks.pins.is_empty() {
-                ui.weak(t("bible.no_pins"));
-            }
-            let bibles = self.bible.bibles.clone();
-            for (i, p) in self.bible.bookmarks.pins.iter_mut().enumerate() {
-                ui.push_id(i, |ui| {
-                    ui.horizontal(|ui| {
-                        let label = if p.bible == bible_id {
-                            p.reference.clone()
-                        } else {
-                            format!("{} ({})", p.reference, name_of(&p.bible, &bibles))
-                        };
-                        if ui.link(label).clicked() {
-                            open = Some(p.clone());
-                        }
-                        if ui.small_button("✖").on_hover_text(t("bible.unpin")).clicked() {
-                            unpin = Some(i);
+        egui::ScrollArea::vertical()
+            .id_salt("pins")
+            .max_height(ui.available_height() * 0.5)
+            .auto_shrink([false, true])
+            .show_following_focus(ui, |ui| {
+                if self.bible.bookmarks.pins.is_empty() {
+                    ui.weak(t("bible.no_pins"));
+                }
+                let bibles = self.bible.bibles.clone();
+                for (i, p) in self.bible.bookmarks.pins.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            let label = if p.bible == bible_id {
+                                p.reference.clone()
+                            } else {
+                                format!("{} ({})", p.reference, name_of(&p.bible, &bibles))
+                            };
+                            if ui.link(label).clicked() {
+                                open = Some(p.clone());
+                            }
+                            if ui.small_button("✖").on_hover_text(t("bible.unpin")).clicked() {
+                                unpin = Some(i);
+                            }
+                        });
+                        let r =
+                            ui.add(egui::TextEdit::singleline(&mut p.note).hint_text(t("bible.note_hint")).desired_width(f32::INFINITY));
+                        if r.lost_focus() {
+                            changed = true;
                         }
                     });
-                    let r = ui.add(egui::TextEdit::singleline(&mut p.note).hint_text(t("bible.note_hint")).desired_width(f32::INFINITY));
-                    if r.lost_focus() {
-                        changed = true;
-                    }
-                });
-            }
-        });
+                }
+            });
         ui.separator();
         ui.horizontal(|ui| {
             ui.heading(format!("🕘 {}", t("bible.history")));
@@ -54,7 +59,7 @@ impl App {
                 changed = true;
             }
         });
-        egui::ScrollArea::vertical().id_salt("history").auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("history").auto_shrink([false, false]).show_following_focus(ui, |ui| {
             if self.bible.bookmarks.history.is_empty() {
                 ui.weak(t("bible.no_history"));
             }
@@ -191,6 +196,9 @@ impl App {
             }
             if let Some(b) = &self.bible.current {
                 let id = b.meta.id.clone();
+                if ui.button(t("export.bible")).on_hover_text(t("export.bible_hint")).clicked() {
+                    self.export_bible_txt();
+                }
                 if ui.button(format!("✖ {}", t("bible.delete"))).clicked() {
                     self.dialog = Some(Dialog::DeleteBible(id));
                 }
@@ -340,7 +348,7 @@ impl App {
         let Some(bible) = self.bible.current.as_ref() else { return };
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
         let mut double = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| {
             for (i, h) in self.bible.results.iter().enumerate() {
                 let Some((_, c, v)) = bible.verse(h) else { continue };
                 let reference =

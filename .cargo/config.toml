@@ -1,0 +1,8 @@
+# Windows (MSVC): the C runtime is linked into the .exe, so it does not need the
+# "Microsoft Visual C++ Redistributable" (vcruntime140.dll), which is missing on some
+# computers. The GNU targets need nothing extra (their runtime is Windows' msvcrt.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

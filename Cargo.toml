@@ -1,6 +1,6 @@
 [package]
 name = "oh-presenter-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Church presentation program: songs, bible passages, videos and designed slides, with output windows on the LAN"
 license = "GPL-3.0-or-later"
@@ -9,9 +9,14 @@ build = "build.rs"
 
 [dependencies]
 base64 = "0.23.1"
+# local time (time zone of the computer) for the clock on the output
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 directories = "6.0.0"
-eframe = "0.37"
+# wgpu (default) plus the OpenGL renderer as a fallback for GPUs/drivers wgpu cannot use
+eframe = { version = "0.37", features = ["glow"] }
 # pure-Rust picture decoders; HEIC / HEIF / AVIF are converted to PNG with ffmpeg when added
+# loads an installed VLC at run time (video without ffmpeg)
+libloading = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico", "tga", "pnm", "qoi", "dds", "hdr", "exr", "ff"] }
 rfd = "0.17.2"
 roxmltree = "0.21.1"
@@ -19,6 +24,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tar = "0.4.46"
+# the screens (monitors) of the main window; the version eframe uses, no extra features
+winit = { version = "0.30", default-features = false }
 zip = "9.0.5"
 
 [build-dependencies]
@@ -34,9 +41,13 @@ name = "oh-presenter-rs"
 maintainer = "oh! Presenter"
 section = "graphics"
 priority = "optional"
-depends = "$auto"
-# plays the videos (ffmpeg) and their sound (ffplay, in the same package)
-recommends = "ffmpeg"
+# $auto only sees libc: the window system (Wayland / X11), keyboard and OpenGL libraries
+# are loaded at run time (dlopen), so they are listed by hand
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6, libxrandr2, libegl1, libgl1"
+# ffmpeg: plays the videos (and ffplay, in the same package, their sound); Vulkan: the
+# faster renderer (without it OpenGL is used); zenity: the message box after a failed start;
+# xdg-desktop-portal: the file dialogs
+recommends = "ffmpeg, libvulkan1, mesa-vulkan-drivers, zenity, xdg-desktop-portal"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 Presents songs, bible passages, videos and designed slides on a local output window \

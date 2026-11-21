@@ -5,10 +5,10 @@ use crate::model::{
     Alert, AlertDirection, AlertFont, CANVAS_H, CANVAS_W, CanvasDoc, ColumnLayout, FontStyle, HAlign, ObjectKind, Scene, TextScene, VAlign,
     VideoScene,
 };
-use std::time::Instant;
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, TextureHandle, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub const OUTPUT_FONT: &str = "output";
 /// A serif system font for alerts (falls back to the output font).
@@ -187,6 +187,14 @@ fn draw_video(painter: &Painter, rect: Rect, v: &VideoScene, tex: &mut TextureCa
         }
         None => false,
     };
+    // ffmpeg could not decode the file (no picture at all): once more, now with VLC
+    if !has_frame
+        && view.player.as_ref().is_some_and(|p| p.is_ffmpeg() && p.finished() && p.no_frame_yet())
+        && crate::video::uses_vlc(&path)
+    {
+        view.player = None;
+        ctx.request_repaint();
+    }
     let running = view.player.as_ref().is_some_and(|p| !p.finished());
     if !has_frame {
         draw_poster(painter, rect, v, tex);
@@ -221,9 +229,12 @@ pub fn draw_canvas(painter: &Painter, rect: Rect, doc: &CanvasDoc, tex: &mut Tex
                     painter.add(egui::Shape::ellipse_stroke(r.center(), radius, Stroke::new(stroke_width * s, stroke.to_color32())));
                 }
             }
-            ObjectKind::Image { media } => match tex.get(painter.ctx(), media) {
+            ObjectKind::Image { media, opacity } => match tex.get(painter.ctx(), media) {
                 Some(t) => {
-                    painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    // the picture's own alpha channel is kept (straight alpha, see TextureCache::get);
+                    // the opacity fades the whole picture on top of it
+                    let tint = Color32::WHITE.gamma_multiply(opacity.clamp(0.0, 1.0));
+                    painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
                 }
                 None => {
                     painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::GRAY), StrokeKind::Inside);
@@ -358,6 +369,18 @@ pub fn alert_pass_secs(painter: &Painter, alert: &Alert) -> f32 {
 /// How long an alert really runs: its duration, but at least once across (0 = until stopped).
 pub fn alert_run_secs(painter: &Painter, alert: &Alert) -> Option<f32> {
     (alert.duration > 0.0).then(|| alert.duration.max(alert_pass_secs(painter, alert)))
+}
+
+/// Height of the alert's strip over a slide `slide_width` wide.
+pub fn alert_strip_height(painter: &Painter, slide_width: f32, alert: &Alert) -> f32 {
+    let s = slide_width / CANVAS_W;
+    let st = &alert.style;
+    let g = painter.layout_no_wrap(
+        alert.text.replace(['\n', '\r'], "  "),
+        FontId::new(st.font_size * s, alert_family(st.font)),
+        Color32::WHITE,
+    );
+    g.size().y + 2.0 * st.font_size * 0.3 * s
 }
 
 /// Draws an alert `elapsed` seconds after it started over the slide in `rect`.

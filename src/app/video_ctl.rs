@@ -1,6 +1,7 @@
 //! Videos in the service: adding them, the live playback controls and the sound.
 
-use super::{App, ItemRef, files};
+use super::service_tab::ServiceArea;
+use super::{App, ItemRef, Tab, files};
 use crate::i18n::{t, tf};
 use crate::model::*;
 use crate::storage;
@@ -9,9 +10,75 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Seconds ← / → move a video.
+pub const VIDEO_SEEK_STEP: f64 = 5.0;
+
+/// The video the video keys (Space, ← / →) work on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoTarget {
+    /// The live video.
+    Live,
+    /// The selected video item, which is not live (Space shows it live).
+    Selected,
+}
+
 impl App {
+    /// The video the video keys work on now: in the Service tab, after a click in the item
+    /// list or the slides, the selected video item; after a click in the live panel, the
+    /// live video. `None` = Space and the arrows keep their slide meaning.
+    pub fn video_key_target(&self) -> Option<VideoTarget> {
+        if self.tab != Tab::Service {
+            return None;
+        }
+        let live_video = matches!(self.live, Scene::Video(_));
+        match self.service_area? {
+            ServiceArea::Live => live_video.then_some(VideoTarget::Live),
+            ServiceArea::List | ServiceArea::Slides => {
+                let sel = self.sel_item?;
+                if !matches!(self.item(sel).map(|i| &i.kind), Some(ItemKind::Video(_))) {
+                    return None;
+                }
+                let is_live = live_video && matches!(self.live_pos, Some((r, _)) if r == sel);
+                Some(if is_live { VideoTarget::Live } else { VideoTarget::Selected })
+            }
+        }
+    }
+
+    /// Space on a video: the live video plays / pauses (from the start once it ended; a
+    /// blanked screen is shown again); a selected video that is not live goes live.
+    pub fn video_play_pause(&mut self, target: VideoTarget) {
+        if target == VideoTarget::Selected {
+            // a video item has one slide
+            self.sel_slide = 0;
+            self.go_live();
+            return;
+        }
+        let Scene::Video(v) = &self.live else { return };
+        let elapsed = self.video_since.elapsed().as_secs_f64();
+        let (playing, ended) = (!v.paused && !v.ended_after(elapsed), v.ended_after(elapsed));
+        if self.blank {
+            self.toggle_blank();
+        }
+        if ended {
+            self.video_update(|v| {
+                v.position = 0.0;
+                v.paused = false;
+            });
+        } else {
+            self.video_update(|v| v.paused = playing);
+        }
+    }
+
+    /// Moves the live video by `secs` (negative = back), within its length.
+    pub fn video_seek(&mut self, secs: f64) {
+        self.video_update(|v| {
+            let end = if v.duration > 0.0 { v.duration } else { f64::INFINITY };
+            v.position = (v.position + secs).clamp(0.0, end);
+        });
+    }
+
     pub fn import_videos(&mut self) {
-        if !video::ffmpeg_available() {
+        if !video::video_available() {
             self.error(t("video.no_ffmpeg_long"));
             return;
         }
@@ -67,7 +134,7 @@ impl App {
         for kind in added {
             self.add_to_service(kind);
         }
-        if any && !video::ffplay_available() {
+        if any && !video::sound_available() {
             self.notify(t("video.no_ffplay"));
         }
         if !errors.is_empty() {
@@ -87,20 +154,27 @@ impl App {
         self.broadcast();
     }
 
-    /// Starts or stops the live video's sound (ffplay) to match the live state.
+    /// Starts or stops the sound (ffplay or VLC) of the video on the output (the live one,
+    /// or the frozen one while the output is frozen).
     pub(super) fn sync_video_audio(&mut self) {
-        let elapsed = self.video_since.elapsed().as_secs_f64();
-        let wanted = match &self.live {
+        let (shown, since) = match &self.frozen {
+            Some((scene, since)) => (scene, *since),
+            None => (&self.live, self.video_since),
+        };
+        let elapsed = since.elapsed().as_secs_f64();
+        let wanted = match shown {
             Scene::Video(v) if !self.blank && !v.paused && !v.muted && !v.ended_after(elapsed) => Some(v),
             _ => None,
         };
         match wanted {
             None => self.video_audio = None,
             Some(v) => {
-                if self.video_audio.as_ref().is_some_and(|(token, _)| *token == v.token) || !video::ffplay_available() {
+                let path = storage::media_path(&v.media);
+                // ffmpeg turned out not to read this file: its sound goes over to VLC too
+                let switch = self.video_audio.as_ref().is_some_and(|(_, a)| a.is_ffplay()) && video::uses_vlc(&path);
+                if (self.video_audio.as_ref().is_some_and(|(token, _)| *token == v.token) && !switch) || !video::sound_available() {
                     return;
                 }
-                let path = storage::media_path(&v.media);
                 self.video_audio = video::Audio::start(&path, v.position_after(elapsed), v.looped).ok().map(|a| (v.token, a));
             }
         }
@@ -138,6 +212,38 @@ impl App {
         ui.separator();
     }
 
+    /// The live preview of a video (Service tab): with the keyboard focus on it, Space
+    /// plays / pauses and ← → go 5 seconds back / forward.
+    pub(super) fn video_preview_id() -> egui::Id {
+        egui::Id::unique("live_video_preview")
+    }
+
+    /// Space / ← → for the live video while its preview has the keyboard focus. Runs
+    /// before the shortcuts, which would step the slides with these keys.
+    pub(super) fn video_keys(&mut self, ctx: &egui::Context) {
+        if self.tab != Tab::Service
+            || !matches!(self.live, Scene::Video(_))
+            || self.dialog.is_some()
+            || self.file_dialog.is_some()
+            || !ctx.memory(|m| m.has_focus(Self::video_preview_id()))
+        {
+            return;
+        }
+        let none = egui::Modifiers::NONE;
+        let (space, left, right) = ctx.input_mut(|i| {
+            (i.consume_key(none, egui::Key::Space), i.consume_key(none, egui::Key::ArrowLeft), i.consume_key(none, egui::Key::ArrowRight))
+        });
+        if space {
+            self.video_play_pause(VideoTarget::Live);
+        }
+        if left {
+            self.video_seek(-VIDEO_SEEK_STEP);
+        }
+        if right {
+            self.video_seek(VIDEO_SEEK_STEP);
+        }
+    }
+
     /// Play / pause, back to the start and the position of the live video (live panel).
     pub(super) fn video_controls(&mut self, ui: &mut egui::Ui) {
         let Scene::Video(v) = &self.live else { return };
@@ -148,18 +254,10 @@ impl App {
         ui.horizontal(|ui| {
             let playing = !paused && !ended;
             let (icon, hint) = if playing { ("⏸", t("video.pause")) } else { ("▶", t("video.play")) };
+            let sc = &self.settings.shortcuts;
+            let hint = format!("{hint} ({})", sc.describe(crate::shortcuts::Action::VideoPlayPause));
             if ui.button(icon).on_hover_text(hint).clicked() {
-                if self.blank {
-                    self.toggle_blank();
-                }
-                if ended {
-                    self.video_update(|v| {
-                        v.position = 0.0;
-                        v.paused = false;
-                    });
-                } else {
-                    self.video_update(|v| v.paused = playing);
-                }
+                self.video_play_pause(VideoTarget::Live);
             }
             if ui.button("⏮").on_hover_text(t("video.restart")).clicked() {
                 self.video_update(|v| v.position = 0.0);

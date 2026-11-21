@@ -1,4 +1,5 @@
-//! Video playback through the `ffmpeg` and `ffplay` programs.
+//! Video playback through the `ffmpeg` and `ffplay` programs, or through an installed VLC
+//! when ffmpeg is not there (see [`crate::vlc`]; `OH_PRESENTER_VIDEO=vlc` / `ffmpeg` forces one).
 //!
 //! `ffmpeg` decodes the video in real time into raw RGBA frames on a pipe; a thread
 //! reads them and the newest frame is shown as a texture (output window, live preview,
@@ -8,6 +9,11 @@
 //!
 //! The programs are looked for in this order: `OH_PRESENTER_FFMPEG` / `OH_PRESENTER_FFPLAY`,
 //! next to the oh-presenter executable (the Windows installer puts them there), then `PATH`.
+//!
+//! A file the installed ffmpeg cannot read (an unsupported format) is played by VLC when
+//! VLC is installed: [`probe`] tries VLC after ffmpeg failed, and a playback in which ffmpeg
+//! delivered no picture marks the file ([`uses_vlc`]), so it is decoded (and its sound
+//! played) by VLC from then on.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -76,6 +82,82 @@ pub fn ffplay_available() -> bool {
     *OK.get_or_init(|| runs(ffplay_path()))
 }
 
+/// What plays the videos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Ffmpeg,
+    Vlc,
+}
+
+/// The player to use: ffmpeg when found, else VLC (`OH_PRESENTER_VIDEO` can force one).
+pub fn choose(forced: Option<&str>, ffmpeg: bool, vlc: impl FnOnce() -> bool) -> Option<Backend> {
+    match forced.map(|f| f.trim().to_ascii_lowercase()).as_deref() {
+        Some("vlc") => return vlc().then_some(Backend::Vlc),
+        Some("ffmpeg") => return ffmpeg.then_some(Backend::Ffmpeg),
+        _ => {}
+    }
+    if ffmpeg {
+        Some(Backend::Ffmpeg)
+    } else if vlc() {
+        Some(Backend::Vlc)
+    } else {
+        None
+    }
+}
+
+fn forced() -> Option<String> {
+    std::env::var("OH_PRESENTER_VIDEO").ok().filter(|v| !v.trim().is_empty())
+}
+
+/// What decodes the pictures (checked once).
+pub fn backend() -> Option<Backend> {
+    static B: OnceLock<Option<Backend>> = OnceLock::new();
+    *B.get_or_init(|| choose(forced().as_deref(), ffmpeg_available(), crate::vlc::available))
+}
+
+/// What plays the sound: ffplay, else VLC (checked once).
+pub fn sound_backend() -> Option<Backend> {
+    static B: OnceLock<Option<Backend>> = OnceLock::new();
+    *B.get_or_init(|| choose(forced().as_deref(), ffplay_available(), crate::vlc::available))
+}
+
+/// Files ffmpeg could not decode (they are played by VLC, see [`uses_vlc`]).
+fn vlc_files() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static F: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+/// Marks a file ffmpeg could not decode: VLC (when installed) plays it from now on.
+fn mark_for_vlc(path: &Path) {
+    if forced().is_none() && crate::vlc::available() {
+        vlc_files().lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf());
+    }
+}
+
+/// Whether this file is played by VLC although ffmpeg is used otherwise (ffmpeg could not
+/// decode it and VLC is installed).
+pub fn uses_vlc(path: &Path) -> bool {
+    vlc_files().lock().unwrap_or_else(|e| e.into_inner()).contains(path)
+}
+
+/// The backend for pictures of this file.
+fn backend_for(path: &Path) -> Option<Backend> {
+    match backend() {
+        Some(Backend::Ffmpeg) if uses_vlc(path) => Some(Backend::Vlc),
+        b => b,
+    }
+}
+
+/// Can videos be played (ffmpeg or VLC)?
+pub fn video_available() -> bool {
+    backend().is_some()
+}
+
+/// Can the sound of videos be played (ffplay or VLC)?
+pub fn sound_available() -> bool {
+    sound_backend().is_some()
+}
+
 /// A new playback token: unique also across restarts of the presenter, so a network
 /// output never mistakes a new playback for the one it already plays.
 pub fn next_token() -> u64 {
@@ -100,9 +182,23 @@ pub fn parse_duration(ffmpeg_log: &str) -> Option<f64> {
 
 /// Length in seconds and a still picture (PNG) of a video file.
 pub fn probe(path: &Path) -> Result<(f64, Option<Vec<u8>>), String> {
-    if !ffmpeg_available() {
-        return Err(crate::i18n::t("video.no_ffmpeg"));
+    match backend() {
+        None => return Err(crate::i18n::t("video.no_ffmpeg")),
+        Some(Backend::Vlc) => return crate::vlc::probe(path),
+        Some(Backend::Ffmpeg) => {}
     }
+    match probe_ffmpeg(path) {
+        // a format the installed ffmpeg does not know: VLC may
+        Err(e) if forced().is_none() && crate::vlc::available() => {
+            let r = crate::vlc::probe(path).map_err(|_| e)?;
+            mark_for_vlc(path);
+            Ok(r)
+        }
+        r => r,
+    }
+}
+
+fn probe_ffmpeg(path: &Path) -> Result<(f64, Option<Vec<u8>>), String> {
     let mut duration = 0.0;
     // a frame one second in (often nicer than the first, black one); short videos: the first
     for seek in ["1", "0"] {
@@ -168,10 +264,14 @@ struct Frames {
     finished: AtomicBool,
 }
 
-/// Decodes one video with ffmpeg, in real time from `position` (or a single frame when paused).
+enum Decoder {
+    Ffmpeg { child: Child, frames: Arc<Frames> },
+    Vlc { video: crate::vlc::Video, frames: Arc<crate::vlc::Frames> },
+}
+
+/// Decodes one video (ffmpeg or VLC), in real time from `position` (or a single frame when paused).
 pub struct Player {
-    child: Child,
-    frames: Arc<Frames>,
+    decoder: Decoder,
     size: (u32, u32),
     shown: u64,
     texture: Option<eframe::egui::TextureHandle>,
@@ -179,6 +279,18 @@ pub struct Player {
 
 impl Player {
     pub fn start(path: &Path, position: f64, looped: bool, paused: bool, size: (u32, u32)) -> std::io::Result<Self> {
+        match backend_for(path) {
+            Some(Backend::Ffmpeg) => Self::start_ffmpeg(path, position, looped, paused, size),
+            Some(Backend::Vlc) => {
+                let frames = Arc::new(crate::vlc::Frames::default());
+                let video = crate::vlc::Video::start(path, position, looped, paused, size, frames.clone())?;
+                Ok(Self { decoder: Decoder::Vlc { video, frames }, size, shown: 0, texture: None })
+            }
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no ffmpeg or VLC")),
+        }
+    }
+
+    fn start_ffmpeg(path: &Path, position: f64, looped: bool, paused: bool, size: (u32, u32)) -> std::io::Result<Self> {
         let (w, h) = size;
         let mut c = command(ffmpeg_path());
         c.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
@@ -201,6 +313,7 @@ impl Player {
         let mut stdout = child.stdout.take().expect("piped stdout");
         let frames = Arc::new(Frames { latest: Mutex::new(None), finished: AtomicBool::new(false) });
         let f = frames.clone();
+        let file = path.to_path_buf();
         std::thread::spawn(move || {
             let len = w as usize * h as usize * 4;
             let mut n = 0;
@@ -212,9 +325,13 @@ impl Player {
                 n += 1;
                 *f.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some((n, buf));
             }
+            if n == 0 {
+                // not a single picture: ffmpeg cannot decode this file, VLC may
+                mark_for_vlc(&file);
+            }
             f.finished.store(true, Ordering::Relaxed);
         });
-        Ok(Self { child, frames, size, shown: 0, texture: None })
+        Ok(Self { decoder: Decoder::Ffmpeg { child, frames }, size, shown: 0, texture: None })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -223,12 +340,34 @@ impl Player {
 
     /// The decoder has ended (end of the video, a single paused frame delivered, or an error).
     pub fn finished(&self) -> bool {
-        self.frames.finished.load(Ordering::Relaxed)
+        match &self.decoder {
+            Decoder::Ffmpeg { frames, .. } => frames.finished.load(Ordering::Relaxed),
+            Decoder::Vlc { video, .. } => video.finished(),
+        }
+    }
+
+    /// Decoded by ffmpeg (not VLC).
+    pub fn is_ffmpeg(&self) -> bool {
+        matches!(self.decoder, Decoder::Ffmpeg { .. })
+    }
+
+    /// No picture has been shown yet.
+    pub fn no_frame_yet(&self) -> bool {
+        self.shown == 0
     }
 
     /// The newest frame as a texture (None until the first frame arrives).
     pub fn texture(&mut self, ctx: &eframe::egui::Context) -> Option<&eframe::egui::TextureHandle> {
-        let newest = self.frames.latest.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let newest = match &self.decoder {
+            Decoder::Ffmpeg { frames, .. } => frames.latest.lock().unwrap_or_else(|e| e.into_inner()).take(),
+            Decoder::Vlc { frames, .. } => frames
+                .latest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .filter(|(_, s, _)| *s == self.size)
+                .map(|(n, _, rgba)| (n, rgba)),
+        };
         if let Some((n, rgba)) = newest
             && n != self.shown
         {
@@ -245,18 +384,31 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Decoder::Ffmpeg { child, .. } = &mut self.decoder {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
-/// The sound of a video, played by ffplay (no window).
-pub struct Audio {
-    child: Child,
+/// The sound of a video, played by ffplay or VLC (no window).
+pub enum Audio {
+    Ffplay(Child),
+    /// (stops when dropped)
+    Vlc(#[allow(dead_code)] crate::vlc::Sound),
 }
 
 impl Audio {
     pub fn start(path: &Path, position: f64, looped: bool) -> std::io::Result<Self> {
+        let backend = match sound_backend() {
+            Some(Backend::Ffmpeg) if uses_vlc(path) => Some(Backend::Vlc),
+            b => b,
+        };
+        match backend {
+            Some(Backend::Ffmpeg) => {}
+            Some(Backend::Vlc) => return crate::vlc::Sound::start(path, position, looped).map(Self::Vlc),
+            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no ffplay or VLC")),
+        }
         let mut c = command(ffplay_path());
         c.args(["-hide_banner", "-loglevel", "error", "-nodisp", "-vn", "-sn"]);
         c.args(["-ss", &format!("{:.3}", position.max(0.0))]);
@@ -267,14 +419,23 @@ impl Audio {
         }
         c.arg(path);
         let child = c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
-        Ok(Self { child })
+        Ok(Self::Ffplay(child))
+    }
+}
+
+impl Audio {
+    /// Played by ffplay (not VLC).
+    pub fn is_ffplay(&self) -> bool {
+        matches!(self, Self::Ffplay(_))
     }
 }
 
 impl Drop for Audio {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Self::Ffplay(child) = self {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

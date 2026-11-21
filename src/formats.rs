@@ -576,7 +576,7 @@ fn canvas_from_fabric(v: &Value, image_src: &mut dyn FnMut(&str) -> Option<Strin
                 }
             }
             "image" | "video" => match o["src"].as_str().and_then(&mut *image_src) {
-                Some(media) => ObjectKind::Image { media },
+                Some(media) => ObjectKind::Image { media, opacity: 1.0 },
                 None => continue,
             },
             _ => continue,
@@ -970,7 +970,7 @@ pub fn full_screen_image(name: &str, media: String, bytes: &[u8]) -> Design {
                 y: (CANVAS_H - h) / 2.0,
                 w,
                 h,
-                kind: ObjectKind::Image { media },
+                kind: ObjectKind::Image { media, opacity: 1.0 },
             }],
         },
     }

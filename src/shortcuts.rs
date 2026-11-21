@@ -98,6 +98,12 @@ pub enum Action {
     Save,
     /// "Save as" for the service, "save as new" for songs and designs.
     SaveAs,
+    /// Play / pause the video (Service tab: the selected or the live video).
+    VideoPlayPause,
+    /// Video 5 seconds forward.
+    VideoForward,
+    /// Video 5 seconds back.
+    VideoBack,
     NextSlide,
     PrevSlide,
     FirstSlide,
@@ -107,6 +113,8 @@ pub enum Action {
     GoLive,
     ToggleLive,
     Blank,
+    /// Freeze: the output keeps its picture while slides are changed.
+    Freeze,
     ToggleOutput,
     OutputFullscreen,
     /// Opens the alert window (a message running across the output).
@@ -129,6 +137,10 @@ impl Action {
         Action::OpenService,
         Action::Save,
         Action::SaveAs,
+        // before the slide keys: on a video they take Space / ← / → first
+        Action::VideoPlayPause,
+        Action::VideoForward,
+        Action::VideoBack,
         Action::NextSlide,
         Action::PrevSlide,
         Action::FirstSlide,
@@ -138,6 +150,7 @@ impl Action {
         Action::GoLive,
         Action::ToggleLive,
         Action::Blank,
+        Action::Freeze,
         Action::ToggleOutput,
         Action::OutputFullscreen,
         Action::Alert,
@@ -172,7 +185,19 @@ impl Action {
                 | Action::GoLive
                 | Action::ToggleLive
                 | Action::Blank
+                | Action::Freeze
         )
+    }
+
+    /// Keys that move between slides / items (a video key may share a key with these).
+    pub fn moves_slides(self) -> bool {
+        matches!(self, Action::NextSlide | Action::PrevSlide | Action::FirstSlide | Action::LastSlide | Action::NextItem | Action::PrevItem)
+    }
+
+    /// Video keys: active only on a video in the Service tab, where they come before the
+    /// slide keys, so sharing a key with slide navigation is not a conflict.
+    pub fn is_video(self) -> bool {
+        matches!(self, Action::VideoPlayPause | Action::VideoForward | Action::VideoBack)
     }
 
     pub fn defaults(self) -> Vec<KeyBinding> {
@@ -184,6 +209,9 @@ impl Action {
             Action::OpenService => vec![c(O)],
             Action::Save => vec![c(S)],
             Action::SaveAs => vec![KeyBinding::ctrl_shift(S)],
+            Action::VideoPlayPause => vec![p(Space)],
+            Action::VideoForward => vec![p(ArrowRight)],
+            Action::VideoBack => vec![p(ArrowLeft)],
             Action::NextSlide => vec![p(ArrowDown), p(PageDown), p(ArrowRight), p(Space)],
             Action::PrevSlide => vec![p(ArrowUp), p(PageUp), p(ArrowLeft)],
             Action::FirstSlide => vec![p(Home)],
@@ -193,6 +221,7 @@ impl Action {
             Action::GoLive => vec![p(Enter)],
             Action::ToggleLive => vec![p(L)],
             Action::Blank => vec![p(Period)],
+            Action::Freeze => vec![p(Comma)],
             Action::ToggleOutput => vec![p(F5)],
             Action::OutputFullscreen => vec![p(F11)],
             Action::Alert => vec![p(F7)],
@@ -231,25 +260,26 @@ impl Shortcuts {
         self.bindings(action).iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")
     }
 
-    /// Other actions already bound to `binding`.
+    /// Other actions already bound to `binding`. A video key may share its key with a slide
+    /// key (it is checked first, and only on a video).
     pub fn conflicts(&self, binding: &KeyBinding, except: Action) -> Vec<Action> {
-        Action::ALL.iter().copied().filter(|a| *a != except && self.bindings(*a).contains(binding)).collect()
+        let shared = |a: Action, b: Action| (a.is_video() && b.moves_slides()) || (a.moves_slides() && b.is_video());
+        Action::ALL.iter().copied().filter(|a| *a != except && !shared(*a, except) && self.bindings(*a).contains(binding)).collect()
     }
 
     /// Returns the triggered actions this frame. Plain keys (no Ctrl/Alt) are skipped
-    /// while a text field has focus.
+    /// where `focus` says the focused widget takes them (see [`KeyFocus`]).
     /// Only actions for which `enabled` returns true are checked (and consumed).
-    pub fn triggered(&self, ctx: &egui::Context, enabled: impl Fn(Action) -> bool) -> Vec<Action> {
-        let typing = ctx.egui_wants_keyboard_input();
+    pub fn triggered(&self, ctx: &egui::Context, focus: KeyFocus, enabled: impl Fn(Action) -> bool) -> Vec<Action> {
         let mut out = Vec::new();
         ctx.input_mut(|input| {
             for action in Action::ALL {
-                if !enabled(*action) || (typing && matches!(action, Action::Undo | Action::Redo)) {
+                if !enabled(*action) || (focus != KeyFocus::None && matches!(action, Action::Undo | Action::Redo)) {
                     // text fields have their own undo
                     continue;
                 }
                 for b in self.bindings(*action) {
-                    if typing && !b.has_modifier() && !is_function_key(b.key) {
+                    if focus.takes(&b) {
                         continue;
                     }
                     if b.consume(input) {
@@ -260,6 +290,48 @@ impl Shortcuts {
             }
         });
         out
+    }
+}
+
+/// Who gets the plain keys (no Ctrl / Alt, not F1–F12) this frame: the shortcuts, or the
+/// focused widget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyFocus {
+    /// Nothing has the keyboard focus: every key is a shortcut.
+    None,
+    /// A widget that is not a text field has the focus (moved there with Tab): it keeps the
+    /// keys it uses itself — Space / Enter press it, arrows and Tab move the focus, Esc
+    /// drops it; every other key is a shortcut.
+    Widget,
+    /// A text field has the focus (or any widget, where shortcuts are strict): it gets all
+    /// plain keys.
+    Text,
+}
+
+impl KeyFocus {
+    /// `lenient`: a focused widget that is not a text field keeps only its own keys
+    /// ([`KeyFocus::Widget`], the Service tab); otherwise any focus takes all plain keys.
+    pub fn of(ctx: &egui::Context, lenient: bool) -> Self {
+        if !ctx.egui_wants_keyboard_input() {
+            KeyFocus::None
+        } else if lenient && !ctx.text_edit_focused() {
+            KeyFocus::Widget
+        } else {
+            KeyFocus::Text
+        }
+    }
+
+    /// Whether the focused widget gets this key (so it is no shortcut now).
+    pub fn takes(self, b: &KeyBinding) -> bool {
+        if b.has_modifier() || is_function_key(b.key) {
+            return false;
+        }
+        use Key::*;
+        match self {
+            KeyFocus::None => false,
+            KeyFocus::Widget => matches!(b.key, Space | Enter | Tab | ArrowUp | ArrowDown | ArrowLeft | ArrowRight | Escape),
+            KeyFocus::Text => true,
+        }
     }
 }
 

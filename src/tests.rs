@@ -222,7 +222,7 @@ impl Harness {
         input.focused = true;
         let app = &mut self.app;
         // as eframe does before every frame
-        app.menu_arrows_as_tab(&self.ctx, &mut input);
+        eframe::App::raw_input_hook(app, &self.ctx, &mut input);
         let mut out = self.ctx.run_ui(input, |ui| app.frame(ui));
         out.textures_delta.clear();
         self.texts.clear();
@@ -522,6 +522,8 @@ fn ui_shows_no_translation_keys() {
             && s.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
     };
     let mut seen = std::collections::HashMap::new();
+    // the clock section with its preview and the output window drawing the clock
+    h.app.settings.clock = ClockStyle { show: true, plain: true, ..Default::default() };
     for lang in ["en", "cs"] {
         crate::i18n::set_language(lang);
         let mut all = Vec::new();
@@ -536,6 +538,8 @@ fn ui_shows_no_translation_keys() {
             Dialog::ConfirmQuit,
             Dialog::ChangedOnDisk { path: "x.ohsvc".into() },
             Dialog::FileExists { path: "x.ohsvc".into(), kind: crate::app::WriteKind::Service },
+            Dialog::LeaveOutput(crate::app::OutputChange::Windowed),
+            Dialog::LeaveOutput(crate::app::OutputChange::Close),
         ] {
             h.app.dialog = Some(d);
             h.frame(vec![]);
@@ -1297,7 +1301,7 @@ fn network_output_receives_videos_in_pieces() {
     let server = Server::start(port);
     let rx = run_client(Some(format!("127.0.0.1:{port}")), "video-canvas".into(), eframe::egui::Context::default());
     // a "video" larger than one piece (contents do not matter for sending)
-    let bytes: Vec<u8> = (0..(2_500_000u32)).map(|i| (i % 251) as u8).collect();
+    let bytes: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
     let media = crate::storage::store_media_bytes(&bytes, "mp4").unwrap();
     let v = Video { title: "clip".into(), media: media.clone(), poster: None, duration: 5.0, looped: false, muted: false };
     server.broadcast(&Scene::Video(VideoScene::new(&v)));
@@ -1373,4 +1377,922 @@ fn ui_arrows_move_through_an_open_menu_like_tab() {
     // with no menu open ↓ steps the slides again
     h.press(Key::ArrowDown);
     assert_eq!(h.app.sel_slide, 1);
+}
+
+#[test]
+fn ui_tab_scrolls_the_focused_item_into_view() {
+    use crate::app::Tab;
+    use eframe::egui::{Key, Order};
+    let mut h = Harness::new();
+    h.app.tab = Tab::Settings;
+    h.frame(vec![]);
+    let mut hidden_at_first = 0;
+    let mut checked = 0;
+    for _ in 0..120 {
+        h.press(Key::Tab);
+        let Some(id) = h.ctx.memory(|m| m.focused()) else { continue };
+        let first = h.ctx.read_response(id).unwrap();
+        if first.layer_id.order != Order::Background {
+            continue;
+        }
+        if first.interact_rect != first.rect {
+            hidden_at_first += 1;
+        }
+        // the scroll (animated) follows within a few frames
+        for _ in 0..40 {
+            h.frame(vec![]);
+        }
+        let r = h.ctx.read_response(id).unwrap();
+        let visible = r.interact_rect.expand(0.5).contains_rect(r.rect);
+        assert!(visible, "the item focused with Tab stays out of view: {:?} shown {:?}", r.rect, r.interact_rect);
+        checked += 1;
+    }
+    assert!(checked > 20, "Tab went through the Settings ({checked})");
+    assert!(hidden_at_first > 0, "the Settings are longer than the window: some item was out of view first");
+}
+
+#[test]
+fn ui_tab_out_of_an_open_menu_closes_it() {
+    use crate::app::Tab;
+    use eframe::egui::{Event, Key, Modifiers, Order, Popup};
+    let mut h = Harness::new();
+    h.app.tab = Tab::Service;
+    h.frame(vec![]);
+    // Alt+1 = the File menu
+    h.frame(vec![Event::ModifiersChanged(Modifiers::ALT)]);
+    h.frame(key(Key::Num1, Modifiers::ALT));
+    h.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(Popup::is_any_open(&h.ctx), "the File menu is open");
+    let mut in_menu = 0;
+    for _ in 0..40 {
+        h.press(Key::Tab);
+        h.frame(vec![]);
+        let Some(id) = h.ctx.memory(|m| m.focused()) else { continue };
+        let order = h.ctx.read_response(id).unwrap().layer_id.order;
+        if Popup::is_id_open(&h.ctx, id.with("popup")) {
+            // the File button itself (Alt+1 focuses it): the menu stays
+            assert_eq!(in_menu, 0);
+            continue;
+        }
+        if order == Order::Foreground {
+            assert!(Popup::is_any_open(&h.ctx), "Tab inside the menu keeps it open");
+            in_menu += 1;
+        } else {
+            assert!(!Popup::is_any_open(&h.ctx), "Tab onto the page behind closes the menu");
+            assert!(!h.texts.iter().any(|t| t.starts_with("Recent services")), "the menu is not drawn any more");
+            assert!(in_menu > 0, "Tab first went through the menu items");
+            return;
+        }
+    }
+    panic!("Tab never left the menu");
+}
+
+// ---------------------------------------------------------------------------
+// Clock on the output
+
+#[test]
+fn encoded_clock_starts_all_red_and_goes_round_in_12_hours() {
+    use crate::clock::{decode, encode};
+    assert_eq!(encode(0), [0, 0, 0]);
+    assert_eq!(encode(12 * 3600), [0, 0, 0], "noon looks like midnight");
+    assert_eq!(encode(12 * 3600 - 1), [3, 3, 3], "all brown just before 12");
+    // 4:30 = 3 h (green) + 90 min (blue) + 0 (red)
+    assert_eq!(encode(4 * 3600 + 30 * 60), [1, 2, 0]);
+    assert_eq!(encode(16 * 3600 + 30 * 60), [1, 2, 0]);
+    // the last dot changes every 11¼ minutes
+    assert_eq!(encode(11 * 60 + 14), [0, 0, 0]);
+    assert_eq!(encode(11 * 60 + 15), [0, 0, 1]);
+    // only one dot (or a run of trailing ones) changes per step, and every state is used once
+    let mut seen = std::collections::HashSet::new();
+    for step in 0..64u32 {
+        let secs = step * 675;
+        let dots = encode(secs);
+        assert!(seen.insert(dots));
+        assert_eq!(decode(dots), secs, "decode is the start of the 11¼ minute window");
+        assert_eq!(encode(secs + 674), dots);
+    }
+    assert_eq!(seen.len(), 64);
+}
+
+#[test]
+fn clock_colour_order_is_red_green_blue_brown() {
+    use crate::clock::{COLOR_KEYS, COLORS};
+    assert_eq!(COLOR_KEYS, ["clock.red", "clock.green", "clock.blue", "clock.brown"]);
+    let [r, g, b, _] = COLORS;
+    assert!(r.r() > r.g() && r.r() > r.b(), "0 is red");
+    assert!(g.g() > g.r() && g.g() > g.b(), "1 is green");
+    assert!(b.b() > b.r() && b.b() > b.g(), "2 is blue");
+}
+
+#[test]
+fn clock_texts_and_repaint() {
+    use crate::clock::{face_time, plain_time, repaint_in};
+    assert_eq!(plain_time(14 * 3600 + 5 * 60 + 59), "14:05");
+    assert_eq!(face_time(0), "12:00");
+    assert_eq!(face_time(16 * 3600 + 30 * 60), "4:30");
+    let mut style = ClockStyle { show: true, ..Default::default() };
+    // encoded only: wait for the next dot change (675 s steps)
+    assert_eq!(repaint_in(&style, 600).as_secs(), 75);
+    style.plain = true;
+    assert_eq!(repaint_in(&style, 610).as_secs(), 50);
+}
+
+#[test]
+fn clock_settings_default_off_and_old_settings_load() {
+    let s: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+    assert!(!s.clock.show && !s.clock.plain);
+    assert_eq!(s.clock.opacity, 100);
+    let s: crate::settings::Settings = serde_json::from_str(r#"{"clock":{"show":true,"position":"TopMiddle"}}"#).unwrap();
+    assert!(s.clock.show);
+    assert_eq!(s.clock.position, ClockPosition::TopMiddle);
+    assert_eq!(s.clock.size, ClockSize::Medium);
+}
+
+// ---------------------------------------------------------------------------
+// Start: screens, loading behind the splash screen, renderer choice, packaging versions
+
+fn monitor(x: i32, y: i32, w: u32, h: u32, primary: bool) -> crate::screens::Monitor {
+    crate::screens::Monitor { name: format!("{w}x{h}"), pos: (x, y), size: (w, h), scale: 1.0, primary }
+}
+
+#[test]
+fn screens_program_on_primary_output_on_second() {
+    use crate::screens::{Placement, plan};
+    let a = monitor(0, 0, 1920, 1080, true);
+    let b = monitor(1920, 0, 1280, 720, false);
+    assert_eq!(plan(&[a.clone(), b.clone()], Some(0)), Placement { main: Some(0), output: Some(1) });
+    // the primary screen listed second, the window opened on the other one
+    assert_eq!(plan(&[b.clone(), a.clone()], Some(0)), Placement { main: Some(1), output: Some(0) });
+    // a projector left of the primary screen (negative coordinates)
+    let left = monitor(-1024, 0, 1024, 768, false);
+    assert_eq!(plan(&[a.clone(), left], None), Placement { main: Some(0), output: Some(1) });
+    // three screens: the first other one
+    let c = monitor(3200, 0, 800, 600, false);
+    assert_eq!(plan(&[a.clone(), b.clone(), c], Some(0)).output, Some(1));
+}
+
+#[test]
+fn screens_fallbacks() {
+    use crate::screens::{Placement, plan};
+    let a = monitor(0, 0, 1920, 1080, true);
+    // one screen: no output screen
+    assert_eq!(plan(std::slice::from_ref(&a), Some(0)), Placement { main: Some(0), output: None });
+    // no screens known (detection failed)
+    assert_eq!(plan(&[], None), Placement { main: None, output: None });
+    // mirrored projector: the same area as the main screen
+    let mirror = monitor(0, 0, 1920, 1080, false);
+    assert_eq!(plan(&[a.clone(), mirror], Some(0)).output, None);
+    // partly overlapping screens are not "another" screen either
+    let overlap = monitor(1000, 500, 1920, 1080, false);
+    assert_eq!(plan(&[a, overlap], Some(0)).output, None);
+    // Wayland: no primary screen; the one the window is on counts as primary
+    let w1 = monitor(0, 0, 1920, 1080, false);
+    let w2 = monitor(1920, 0, 1920, 1080, false);
+    assert_eq!(plan(&[w1.clone(), w2.clone()], Some(1)), Placement { main: Some(1), output: Some(0) });
+    // ...and without that, the first one; an out-of-range current index is ignored
+    assert_eq!(plan(&[w1.clone(), w2.clone()], None), Placement { main: Some(0), output: Some(1) });
+    assert_eq!(plan(&[w1, w2], Some(7)), Placement { main: Some(0), output: Some(1) });
+    // touching screens (side by side) do not overlap
+    let a = monitor(0, 0, 100, 100, true);
+    let b = monitor(100, 0, 100, 100, false);
+    assert_eq!(plan(&[a, b], Some(0)).output, Some(1));
+}
+
+#[test]
+fn screens_centering_and_containment() {
+    use crate::screens::{centered_on, contains};
+    let m = monitor(1920, 0, 1280, 720, false);
+    assert_eq!(centered_on(&m, (640, 360)), (1920 + 320, 180));
+    // bigger than the screen: its top-left corner
+    assert_eq!(centered_on(&m, (2000, 1000)), (1920, 0));
+    assert!(contains(&m, (1920, 0)));
+    assert!(contains(&m, (3199, 719)));
+    assert!(!contains(&m, (3200, 0)));
+    assert!(!contains(&m, (1919, 10)));
+}
+
+#[test]
+fn startup_loading_reports_progress_and_loads_the_library() {
+    test_home();
+    let mut song = Song::new();
+    song.title = "Startup progress test".into();
+    let mut lib = crate::storage::Library::load();
+    lib.save_song(&song).unwrap();
+    let mut seen = Vec::new();
+    let loaded = crate::app::startup_load(&mut |f| seen.push(f));
+    assert!(loaded.lib.songs.iter().any(|s| s.id == song.id), "the saved song is loaded");
+    assert_eq!(seen.first(), Some(&0.0));
+    assert_eq!(seen.last(), Some(&1.0));
+    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "progress only grows: {seen:?}");
+    assert!(seen.iter().all(|f| (0.0..=1.0).contains(f)));
+    assert!(seen.len() > 3, "progress per file, not only start and end: {seen:?}");
+}
+
+#[test]
+fn startup_progress_fraction() {
+    use crate::app::startup_fraction as fraction;
+    assert_eq!(fraction(0, 0), 1.0);
+    assert_eq!(fraction(0, 10), 0.0);
+    assert_eq!(fraction(5, 10), 0.5);
+    assert_eq!(fraction(15, 10), 1.0);
+}
+
+#[test]
+fn renderer_order_after_failed_starts() {
+    use crate::start_guard::{order, other, parse};
+    use eframe::Renderer::{Glow, Wgpu};
+    assert_eq!(order(None, None), vec![Wgpu, Glow]);
+    // what worked last time goes first
+    assert_eq!(order(Some(Glow), None), vec![Glow, Wgpu]);
+    assert_eq!(order(Some(Wgpu), None), vec![Wgpu, Glow]);
+    // a start that never showed a window puts its renderer last
+    assert_eq!(order(None, Some(Wgpu)), vec![Glow, Wgpu]);
+    assert_eq!(order(Some(Wgpu), Some(Wgpu)), vec![Glow, Wgpu]);
+    assert_eq!(order(Some(Glow), Some(Glow)), vec![Wgpu, Glow]);
+    assert_eq!(other(Wgpu), Glow);
+    assert_eq!(other(Glow), Wgpu);
+    assert_eq!(parse("wgpu\n"), Some(Wgpu));
+    assert_eq!(parse(" glow "), Some(Glow));
+    assert_eq!(parse("vulkan"), None);
+    assert_eq!(parse(""), None);
+}
+
+#[test]
+fn packaging_versions_match_cargo() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let version = env!("CARGO_PKG_VERSION");
+    let iss = std::fs::read_to_string(root.join("packaging/windows/oh-presenter.iss")).unwrap();
+    assert!(iss.contains(&format!("#define AppVersion \"{version}\"")), "oh-presenter.iss AppVersion must be {version}");
+    let metainfo = std::fs::read_to_string(root.join("packaging/flatpak/cz.oh.Presenter.metainfo.xml")).unwrap();
+    assert!(metainfo.contains(&format!("<release version=\"{version}\"")), "the newest metainfo release must be {version}");
+}
+
+#[test]
+fn installer_upgrades_cleanly() {
+    let iss = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packaging/windows/oh-presenter.iss")).unwrap();
+    // the same AppId is what makes a new version replace the old one
+    assert!(iss.contains("AppId={{6F1B6C2E-4E0B-4C8E-9B0A-0E5D3B7A9C41}"));
+    // every file the installer ships is removed first, so no file of an old version stays
+    let install_delete = iss.split("[InstallDelete]").nth(1).expect("[InstallDelete] section").split("\n[").next().unwrap();
+    for line in iss.lines().filter(|l| l.starts_with("Source:")) {
+        let dest = line
+            .split("DestName: \"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or_else(|| line.split('"').nth(1).unwrap().rsplit('\\').next().unwrap());
+        let dest = dest.replace("{#AppExe}", "oh-presenter-rs.exe");
+        assert!(install_delete.contains(&format!("{{app}}\\{dest}")), "[InstallDelete] misses {dest}");
+    }
+    // user data is never deleted
+    assert!(!iss.contains("[UninstallDelete]"));
+    assert!(!iss.to_lowercase().contains("{userappdata}") && !iss.to_lowercase().contains("{localappdata}"));
+    // the firewall rule is deleted before it is added, so upgrades do not pile up copies
+    let delete = iss.find("advfirewall firewall delete rule").expect("delete before add");
+    let add = iss.find("advfirewall firewall add rule").unwrap();
+    assert!(delete < add);
+}
+
+#[test]
+fn screens_wait_for_the_window_on_wayland() {
+    use crate::screens::must_wait;
+    let w1 = monitor(0, 0, 1920, 1080, false);
+    let w2 = monitor(1920, 0, 1920, 1080, false);
+    // Wayland before the window is shown: no primary, window's screen unknown -> wait
+    assert!(must_wait(&[w1.clone(), w2.clone()], None));
+    assert!(must_wait(&[w1.clone(), w2.clone()], Some(5)));
+    // known screen, a primary screen, or nothing to choose from -> no need to wait
+    assert!(!must_wait(&[w1.clone(), w2.clone()], Some(1)));
+    assert!(!must_wait(&[monitor(0, 0, 1920, 1080, true), w2], None));
+    assert!(!must_wait(std::slice::from_ref(&w1), None));
+    assert!(!must_wait(&[], None));
+}
+
+// ---------------------------------------------------------------------------
+// Video through VLC (when ffmpeg is missing)
+
+#[test]
+fn video_backend_choice() {
+    use crate::video::{Backend, choose};
+    assert_eq!(choose(None, true, || true), Some(Backend::Ffmpeg), "ffmpeg first");
+    assert_eq!(choose(None, false, || true), Some(Backend::Vlc), "VLC without ffmpeg");
+    assert_eq!(choose(None, false, || false), None);
+    assert_eq!(choose(Some("vlc"), true, || true), Some(Backend::Vlc), "forced");
+    assert_eq!(choose(Some("VLC"), true, || false), None, "forced but missing");
+    assert_eq!(choose(Some("ffmpeg"), false, || true), None);
+    assert_eq!(choose(Some("other"), false, || true), Some(Backend::Vlc));
+}
+
+#[test]
+fn vlc_pictures_fit_and_letterbox() {
+    use crate::vlc::{bgrx_to_rgba, fit, supported_version};
+    assert!(supported_version("3.0.20 Vetinari"));
+    assert!(!supported_version("4.0.0-dev Otto Chriek"));
+    assert!(!supported_version("x"));
+    assert_eq!(fit((1920, 1080), (1280, 720)), (1280, 720));
+    assert_eq!(fit((640, 480), (1280, 720)), (960, 720), "4:3 gets bars left and right");
+    assert_eq!(fit((1000, 200), (640, 4096)), (640, 128), "poster: 640 wide");
+    assert_eq!(fit((0, 0), (16, 9)), (16, 9));
+    // a 1×1 blue (B G R X) pixel in a 3×1 picture: black, blue, black
+    let out = bgrx_to_rgba(&[255, 0, 0, 0], (1, 1), (3, 1));
+    assert_eq!(out, vec![0, 0, 0, 255, 0, 0, 255, 255, 0, 0, 0, 255]);
+    let same = bgrx_to_rgba(&[1, 2, 3, 0, 4, 5, 6, 0], (2, 1), (2, 1));
+    assert_eq!(same, vec![3, 2, 1, 255, 6, 5, 4, 255]);
+}
+
+/// Plays a real video through libvlc (only where VLC 3 and the sample video are installed).
+#[test]
+fn vlc_plays_a_real_video() {
+    let sample = std::path::Path::new("/usr/share/help/C/gnome-help/figures/display-dual-monitors.webm");
+    if !sample.is_file() || !crate::vlc::available() {
+        eprintln!("skipped: no VLC or no sample video");
+        return;
+    }
+    let (duration, poster) = crate::vlc::probe(sample).expect("probe");
+    assert!(duration > 1.0, "length {duration}");
+    let poster = image::load_from_memory(&poster.expect("a still picture")).expect("PNG");
+    assert_eq!(poster.width(), 640);
+    // the picture, in real time, letterboxed into 640×360
+    let frames = std::sync::Arc::new(crate::vlc::Frames::default());
+    let video = crate::vlc::Video::start(sample, 0.0, false, false, (640, 360), frames.clone()).expect("start");
+    let begin = std::time::Instant::now();
+    while frames.count.load(std::sync::atomic::Ordering::SeqCst) < 10 && begin.elapsed().as_secs() < 15 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let n = frames.count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(n >= 10, "frames: {n}");
+    let (_, size, rgba) = frames.latest.lock().unwrap().take().unwrap();
+    assert_eq!(size, (640, 360));
+    assert_eq!(rgba.len(), 640 * 360 * 4);
+    assert!(rgba.chunks(4).any(|p| p[0] > 40 || p[1] > 40 || p[2] > 40), "not all black");
+    // real time, not as fast as possible: 10 frames take a moment
+    assert!(begin.elapsed().as_millis() > 150);
+    assert!(!video.finished());
+    drop(video);
+    // paused: one frame, then finished
+    let frames = std::sync::Arc::new(crate::vlc::Frames::default());
+    let paused = crate::vlc::Video::start(sample, 2.0, false, true, (320, 180), frames.clone()).expect("start");
+    let begin = std::time::Instant::now();
+    while !paused.finished() && begin.elapsed().as_secs() < 15 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(paused.finished(), "the paused frame arrived");
+    drop(paused);
+    // what the output window uses: the chosen player (VLC here when ffmpeg is missing) gives textures
+    let ctx = eframe::egui::Context::default();
+    let mut player = crate::video::Player::start(sample, 0.0, true, false, (640, 360)).expect("player");
+    let begin = std::time::Instant::now();
+    let mut texture = None;
+    while texture.is_none() && begin.elapsed().as_secs() < 15 {
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        texture = player.texture(&ctx).map(|t| t.size());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(texture, Some([640, 360]));
+    ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+    // the sound player starts and stops (no sound track in this sample: nothing is heard)
+    drop(crate::video::Audio::start(sample, 0.0, false).expect("sound"));
+}
+
+#[test]
+fn bible_txt_round_trip_and_loose_text() {
+    use crate::bible::import_txt;
+    let txt = "# name: Test Bible\n# language: en\nGenesis 1:1 In the beginning.\nGenesis 1:2 And the earth\nwas without form.\n1 Samuel 3:4 Samuel!\n";
+    let b = import_txt(txt, "file");
+    assert_eq!(b.meta.name, "Test Bible");
+    assert_eq!(b.verse_count(), 3);
+    assert_eq!(b.books[0].number, 1);
+    assert_eq!(b.books[1].number, 9, "1 Samuel found by name");
+    assert_eq!(b.books[0].chapters[0].verses[1].text, "And the earth was without form.", "a wrapped line continues the verse");
+    // written out and read back: the same verses
+    let again = import_txt(&b.to_txt(), "other");
+    assert_eq!(again.meta.name, "Test Bible");
+    assert_eq!(again.verse_count(), 3);
+    assert_eq!(again.books[1].chapters[0].number, 3);
+    assert_eq!(again.books[1].chapters[0].verses[0].number, 4);
+    // any text: headings, verse numbers, plain lines
+    let loose = import_txt("Jan\nKapitola 3\n16 Neboť tak Bůh miloval svět\nNumbers had 1,000 sheep here\nplain line", "loose");
+    assert_eq!(loose.meta.name, "loose");
+    assert_eq!(loose.books[0].number, 43);
+    assert_eq!(loose.books[0].chapters[0].number, 3);
+    assert_eq!(loose.books[0].chapters[0].verses[0].number, 16);
+    assert!(loose.verse_count() >= 1);
+    let prose = import_txt("first\nsecond", "prose");
+    assert_eq!(prose.verse_count(), 2, "unnumbered lines become verses");
+}
+
+#[test]
+fn ui_live_mode_on_shows_the_selected_slide() {
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Song(sample_song())));
+    h.app.tab = crate::app::Tab::Service;
+    h.frame(vec![]);
+    h.press(Key::L); // off
+    assert!(!h.app.settings.live_follows_selection);
+    h.press(Key::ArrowDown);
+    h.press(Key::ArrowDown);
+    assert_eq!(h.app.live_pos, None, "preview mode: nothing went live");
+    h.press(Key::L); // on: the selected slide goes live
+    assert!(h.app.settings.live_follows_selection);
+    assert_eq!(h.app.live_pos, Some((crate::app::ItemRef::Service(0), 1)));
+}
+
+#[test]
+fn ui_tab_key_starts_at_the_open_tab() {
+    use crate::app::Tab;
+    use eframe::egui::{Key, Modifiers};
+    let mut h = Harness::new();
+    h.app.tab = Tab::Bible;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let id = |h: &Harness, t: Tab| h.app.alt_nav.tab_ids.iter().find(|(x, _)| *x == t).unwrap().1;
+    h.frame(key(Key::Tab, Modifiers::NONE));
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Settings)), "Tab from Bible goes to Settings");
+    // nothing focused again: Shift+Tab goes back from Bible
+    h.ctx.memory_mut(|m| m.surrender_focus(id(&h, Tab::Settings)));
+    h.frame(vec![]);
+    for _ in 0..3 {
+        h.frame(key(Key::Tab, Modifiers::SHIFT));
+        h.frame(vec![]);
+    }
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Service)), "3× Shift+Tab from Bible");
+}
+
+#[test]
+fn ui_service_border_moves_with_arrows() {
+    use eframe::egui::{Key, Modifiers, containers::panel::PanelState};
+    let mut h = Harness::new();
+    h.app.tab = crate::app::Tab::Service;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let (left, right) = h.app.service_panel_ids().unwrap();
+    let width = |h: &Harness, id| PanelState::load(&h.ctx, id).expect("the panel id is egui's").outer_rect.width();
+    let (l0, r0) = (width(&h, left), width(&h, right));
+    h.ctx.memory_mut(|m| m.request_focus(left.with("__resize")));
+    h.frame(vec![]);
+    h.frame(key(Key::ArrowRight, Modifiers::NONE));
+    h.frame(vec![]);
+    assert!((width(&h, left) - (l0 + 10.0)).abs() < 1.5, "{} -> {}", l0, width(&h, left));
+    h.frame(key(Key::ArrowLeft, Modifiers::SHIFT));
+    h.frame(vec![]);
+    assert!((width(&h, left) - (l0 - 40.0)).abs() < 1.5);
+    assert_eq!(h.app.sel_item, None, "the arrows did not step slides");
+    h.ctx.memory_mut(|m| m.request_focus(right.with("__resize")));
+    h.frame(vec![]);
+    h.frame(key(Key::ArrowLeft, Modifiers::NONE));
+    h.frame(vec![]);
+    assert!((width(&h, right) - (r0 + 10.0)).abs() < 1.5, "moving the right border left widens the live column");
+    // Ctrl+Shift+→ moves between the columns
+    h.ctx.memory_mut(|m| m.surrender_focus(right.with("__resize")));
+    h.frame(vec![]);
+    h.frame(key(Key::ArrowRight, Modifiers::CTRL | Modifiers::SHIFT));
+    h.frame(vec![]);
+    let f = h.ctx.memory(|m| m.focused()).and_then(|f| h.ctx.read_response(f)).expect("focused");
+    assert!(f.rect.center().x < 400.0, "the items column first");
+    for _ in 0..2 {
+        h.frame(key(Key::ArrowRight, Modifiers::CTRL | Modifiers::SHIFT));
+        h.frame(vec![]);
+    }
+    let f = h.ctx.memory(|m| m.focused()).and_then(|f| h.ctx.read_response(f)).expect("focused");
+    assert!(f.rect.center().x > 1000.0, "the live column (no item selected: the slides column is skipped)");
+}
+
+#[test]
+fn ui_video_keys_on_the_focused_preview() {
+    use eframe::egui::{Key, Modifiers};
+    let mut h = Harness::new();
+    h.app.tab = crate::app::Tab::Service;
+    let v = Video { title: "v".into(), media: "none.mp4".into(), poster: None, duration: 60.0, looped: false, muted: true };
+    h.app.set_live(Scene::Video(VideoScene::new(&v)), None);
+    h.frame(vec![]);
+    h.ctx.memory_mut(|m| m.request_focus(crate::app::App::video_preview_id_for_test()));
+    h.frame(vec![]);
+    h.frame(key(Key::Space, Modifiers::NONE));
+    let Scene::Video(s) = &h.app.live else { panic!() };
+    assert!(s.paused, "Space pauses");
+    h.frame(key(Key::ArrowRight, Modifiers::NONE));
+    h.frame(key(Key::ArrowRight, Modifiers::NONE));
+    let Scene::Video(s) = &h.app.live else { panic!() };
+    assert!((s.position - 10.0).abs() < 0.5, "{}", s.position);
+    h.frame(key(Key::ArrowLeft, Modifiers::NONE));
+    let Scene::Video(s) = &h.app.live else { panic!() };
+    assert!((s.position - 5.0).abs() < 0.5);
+    h.frame(key(Key::Space, Modifiers::NONE));
+    let Scene::Video(s) = &h.app.live else { panic!() };
+    assert!(!s.paused, "Space plays again");
+}
+
+#[test]
+fn clock_sizes_and_old_settings() {
+    let s: crate::settings::Settings = serde_json::from_str(r#"{"clock":{"show":true,"size":"Large"}}"#).unwrap();
+    assert_eq!(s.clock.size, ClockSize::Medium, "the removed largest size becomes the new largest");
+    let s: crate::settings::Settings = serde_json::from_str(r#"{"clock":{"size":"Tiny"}}"#).unwrap();
+    assert_eq!(s.clock.size, ClockSize::Tiny);
+}
+
+#[test]
+fn image_opacity_defaults_to_full_and_old_designs_load() {
+    let o: ObjectKind = serde_json::from_str(r#"{"Image":{"media":"a.png"}}"#).unwrap();
+    assert_eq!(o, ObjectKind::Image { media: "a.png".into(), opacity: 1.0 });
+    assert_eq!(serde_json::to_string(&o).unwrap(), r#"{"Image":{"media":"a.png"}}"#, "full opacity is not written");
+    let half = ObjectKind::Image { media: "a.png".into(), opacity: 0.5 };
+    assert_eq!(serde_json::from_str::<ObjectKind>(&serde_json::to_string(&half).unwrap()).unwrap(), half);
+}
+
+#[test]
+fn output_goes_on_the_last_used_screen_else_another_one() {
+    use crate::screens::{ScreenId, output_screen};
+    let primary = monitor(0, 0, 1920, 1080, true);
+    let second = monitor(1920, 0, 1280, 720, false);
+    let third = monitor(-1920, 0, 1600, 900, false);
+    let mirror = monitor(0, 0, 1920, 1080, false);
+    let all = vec![primary.clone(), second.clone(), third.clone()];
+    assert_eq!(output_screen(&all, Some(0), None), Some(1), "the first other screen");
+    assert_eq!(output_screen(&all, Some(0), Some(&ScreenId::of(&third))), Some(2), "the last used one");
+    assert_eq!(output_screen(&all, Some(2), Some(&ScreenId::of(&third))), Some(0), "never the program's screen");
+    // the program was started on the second screen: still another screen than its own
+    assert_eq!(output_screen(&all, Some(1), None), Some(0));
+    // a remembered screen found by its name after it moved
+    let moved = ScreenId { pos: (5000, 0), ..ScreenId::of(&third) };
+    assert_eq!(output_screen(&all, Some(0), Some(&moved)), Some(2));
+    // a gone screen is forgotten
+    let gone = ScreenId { name: "gone".into(), pos: (9000, 0), size: (800, 600) };
+    assert_eq!(output_screen(&all, Some(0), Some(&gone)), Some(1));
+    // one screen, or only a mirror of it: none
+    assert_eq!(output_screen(std::slice::from_ref(&primary), Some(0), None), None);
+    assert_eq!(output_screen(&[primary.clone(), mirror], Some(0), None), None);
+    assert_eq!(output_screen(&[], None, None), None);
+}
+
+#[test]
+fn output_fullscreen_steps_recover_from_the_windows_quarter_screen() {
+    use crate::screens::{Seen, Step, fullscreen_ok, fullscreen_step, windowed_step};
+    let second = monitor(1920, 0, 1280, 720, false);
+    let fine = Seen { outer: Some((1920, 0, 1280, 720)), inner_size: Some((1280, 720)), fullscreen: Some(true) };
+    assert!(fullscreen_ok(&second, &fine));
+    assert_eq!(fullscreen_step(&second, &fine, 0), None, "already there: nothing to do");
+    // a new (windowed) window on the primary screen: first the direct way
+    let new = Seen { outer: Some((480, 270, 960, 540)), inner_size: Some((960, 540)), fullscreen: Some(false) };
+    assert_eq!(fullscreen_step(&second, &new, 0), Some(Step::SetMonitor));
+    // what Windows did: "full screen", but on the primary screen at its first size
+    let quarter = Seen { fullscreen: Some(true), ..new };
+    assert!(!fullscreen_ok(&second, &quarter));
+    assert_eq!(fullscreen_step(&second, &quarter, 1), Some(Step::LeaveFullscreen));
+    // windowed again on the wrong screen: moved onto the output's screen, centered
+    assert_eq!(fullscreen_step(&second, &new, 2), Some(Step::MoveTo((1920 + 160, 90))));
+    // there now: full screen where it is
+    let moved = Seen { outer: Some((2080, 90, 960, 540)), ..new };
+    assert_eq!(fullscreen_step(&second, &moved, 3), Some(Step::SetMonitor));
+    assert_eq!(fullscreen_step(&second, &moved, 4), Some(Step::EnterFullscreen));
+    // full screen on the right screen but not filling it (a scaling mistake): out and in again
+    let small = Seen { outer: Some((1920, 0, 640, 360)), inner_size: Some((640, 360)), fullscreen: Some(true) };
+    assert_eq!(fullscreen_step(&second, &small, 5), Some(Step::LeaveFullscreen));
+    // Wayland: no positions; the size tells
+    let wayland = Seen { outer: None, inner_size: Some((1280, 720)), fullscreen: Some(true) };
+    assert!(fullscreen_ok(&second, &wayland));
+    // a windowed output (F5) opens on the output's screen, once; moved by the user it stays
+    assert_eq!(windowed_step(Some(&second), &new, 0), Some(Step::MoveTo((1920 + 160, 90))));
+    assert_eq!(windowed_step(Some(&second), &new, 2), None);
+    assert_eq!(windowed_step(Some(&second), &moved, 0), None);
+    assert_eq!(windowed_step(None, &quarter, 0), Some(Step::LeaveFullscreen));
+}
+
+#[test]
+fn last_output_screen_setting_loads() {
+    let s: crate::settings::Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(s.output_screen, None);
+    let s: crate::settings::Settings =
+        serde_json::from_str(r#"{"output_screen":{"name":"HDMI-1","pos":[1920,0],"size":[1280,720]}}"#).unwrap();
+    assert_eq!(s.output_screen.unwrap().name, "HDMI-1");
+}
+
+// ---------------------------------------------------------------------------
+// plan.txt: output full screen on another screen, freeze, video keys, keys on the Service tab
+
+fn sample_video(duration: f64) -> ServiceItem {
+    ServiceItem::new(ItemKind::Video(Video {
+        title: "clip".into(),
+        media: "none.mp4".into(),
+        poster: None,
+        duration,
+        looped: false,
+        muted: false,
+    }))
+}
+
+fn live_video(app: &crate::app::App) -> VideoScene {
+    match &app.live {
+        Scene::Video(v) => v.clone(),
+        other => panic!("live is not a video: {other:?}"),
+    }
+}
+
+/// A click (press + release) at `pos`, in points of the 1400 x 900 window.
+fn click_at(pos: eframe::egui::Pos2) -> Vec<eframe::egui::Event> {
+    use eframe::egui::{Event, Modifiers, PointerButton};
+    vec![
+        Event::PointerMoved(pos),
+        Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+    ]
+}
+
+#[test]
+fn ui_leaving_full_screen_on_another_screen_asks_first() {
+    use crate::app::{Dialog, OutputChange};
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.output_open = true;
+    h.app.output_fullscreen = true;
+    h.app.set_screens(Some(0), Some(1));
+    h.frame(vec![]);
+    assert!(h.app.output_on_other_screen());
+
+    // F11 (from either window): only a question, the output stays full screen. (Without a
+    // native backend the output window is drawn inside the main one and gets the key first:
+    // it is handled on the next frame, as from the real output window.)
+    h.press(Key::F11);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::LeaveOutput(OutputChange::Windowed))), "{:?}", h.app.dialog);
+    assert!(h.app.output_fullscreen && h.app.output_open);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("dialog.output_leave")), "{:?}", h.texts);
+    // cancel: still full screen
+    h.app.dialog = None;
+    h.frame(vec![]);
+    assert!(h.app.output_fullscreen);
+    // F5 asks before closing
+    h.press(Key::F5);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::LeaveOutput(OutputChange::Close))), "{:?}", h.app.dialog);
+    assert!(h.app.output_open);
+    h.app.dialog = None;
+    // Esc / double click in the output window and its close button ask too
+    for (fullscreen, close, change) in
+        [(Some(false), false, OutputChange::Windowed), (Some(true), false, OutputChange::Windowed), (None, true, OutputChange::CloseButton)]
+    {
+        h.app.output_reports(fullscreen, close);
+        h.frame(vec![]);
+        assert_eq!(h.app.dialog.as_ref().map(|d| format!("{d:?}")), Some(format!("{:?}", Dialog::LeaveOutput(change))));
+        assert!(h.app.output_open && h.app.output_fullscreen);
+        h.app.dialog = None;
+        h.frame(vec![]);
+    }
+    // confirmed: out of full screen
+    h.press(Key::F11);
+    h.frame(vec![]);
+    let ctx = h.ctx.clone();
+    h.app.dialog = None;
+    h.app.apply_output_change(OutputChange::Windowed, &ctx);
+    assert!(!h.app.output_fullscreen && h.app.output_open);
+    // windowed: F11 goes full screen again without a question
+    h.press(Key::F11);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none());
+    assert!(h.app.output_fullscreen);
+
+    // one screen: no question
+    h.app.set_screens(Some(0), None);
+    h.press(Key::F11);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+    assert!(!h.app.output_fullscreen);
+    h.press(Key::F11);
+    h.frame(vec![]);
+    assert!(h.app.output_fullscreen);
+    h.press(Key::F5);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none());
+    assert!(!h.app.output_open);
+    // the close button of a windowed output closes it right away
+    h.press(Key::F5);
+    h.frame(vec![]);
+    h.app.set_screens(Some(0), Some(1));
+    h.app.output_fullscreen = false;
+    h.app.output_reports(None, true);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none());
+    assert!(!h.app.output_open);
+}
+
+#[test]
+fn ui_pointer_shows_over_a_windowed_output() {
+    let mut h = Harness::new();
+    h.app.output_open = true;
+    h.app.settings.output_always_on_top = true;
+    h.app.output_fullscreen = false;
+    h.frame(vec![]);
+    assert!(!h.app.output_hides_cursor(), "a window shows the pointer");
+    h.app.output_fullscreen = true;
+    h.frame(vec![]);
+    assert!(h.app.output_hides_cursor(), "full screen + always on top hides it");
+    h.app.settings.output_always_on_top = false;
+    h.frame(vec![]);
+    assert!(!h.app.output_hides_cursor());
+}
+
+#[test]
+fn ui_freeze_keeps_the_output() {
+    use crate::app::ItemRef;
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "A".into(), text: "one\n---\ntwo\n---\nthree".into() }));
+    h.frame(vec![]);
+    h.press(Key::ArrowDown);
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(0), 0)));
+    let first = h.app.output_scene();
+    // "," freezes: the slides go on, the output stays
+    h.press(Key::Comma);
+    assert!(h.app.frozen.is_some());
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("status.frozen")), "{:?}", h.texts);
+    h.press(Key::ArrowDown);
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(0), 1)));
+    assert_eq!(h.app.output_scene(), first);
+    assert_ne!(h.app.live, first);
+    // blank still blanks a frozen output
+    h.press(Key::Period);
+    assert_eq!(h.app.output_scene(), Scene::Blank);
+    h.press(Key::Period);
+    assert_eq!(h.app.output_scene(), first);
+    // "," again: the live slide is shown
+    h.press(Key::Comma);
+    assert!(h.app.frozen.is_none());
+    assert_eq!(h.app.output_scene(), h.app.live);
+    assert_ne!(h.app.output_scene(), first);
+    // a frozen video keeps playing on the output; blanking pauses it; unfreezing sends the live one anew
+    h.app.service.items.push(sample_video(100.0));
+    h.app.select(ItemRef::Service(1), 0);
+    let token = live_video(&h.app).token;
+    h.app.toggle_freeze();
+    h.app.select(ItemRef::Service(0), 0);
+    assert!(matches!(h.app.output_scene(), Scene::Video(v) if v.token == token));
+    h.app.toggle_blank();
+    assert!(matches!(&h.app.frozen, Some((Scene::Video(v), _)) if v.paused && v.token != token));
+    h.app.toggle_blank();
+    h.app.select(ItemRef::Service(1), 0);
+    let live_token = live_video(&h.app).token;
+    h.app.toggle_freeze();
+    assert!(matches!(h.app.output_scene(), Scene::Video(v) if v.token != token && v.token != live_token));
+}
+
+#[test]
+fn ui_video_keys_on_the_service_tab() {
+    use crate::app::ItemRef;
+    use crate::app::ServiceArea as area;
+    use eframe::egui::{Key, pos2};
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "A".into(), text: "one\n---\ntwo".into() }));
+    h.app.service.items.push(sample_video(100.0));
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "B".into(), text: "three".into() }));
+    h.app.settings.live_follows_selection = false;
+    h.frame(vec![]);
+    // nothing clicked yet: Space is the next slide
+    h.press(Key::Space);
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    h.app.sel_item = Some(ItemRef::Service(1));
+    h.app.sel_slide = 0;
+    // a click in the item list (left): the selected video takes Space and the arrows
+    h.frame(click_at(pos2(100.0, 450.0)));
+    h.frame(vec![]);
+    assert_eq!(h.app.service_area, Some(area::List), "click in the item list");
+    h.app.sel_item = Some(ItemRef::Service(1));
+    h.app.sel_slide = 0;
+    // → on a video that is not live does nothing (no jump to the next item)
+    h.press(Key::ArrowRight);
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    assert!(h.app.live_pos.is_none());
+    // Space: the video goes live and plays
+    h.press(Key::Space);
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(1), 0)));
+    assert!(!live_video(&h.app).paused);
+    // → / ←: 5 s forward / back, not before the start nor after the end
+    h.press(Key::ArrowRight);
+    let p = live_video(&h.app).position;
+    assert!((5.0..5.5).contains(&p), "{p}");
+    h.press(Key::ArrowLeft);
+    h.press(Key::ArrowLeft);
+    assert_eq!(live_video(&h.app).position, 0.0);
+    for _ in 0..30 {
+        h.press(Key::ArrowRight);
+    }
+    assert_eq!(live_video(&h.app).position, 100.0);
+    h.press(Key::ArrowLeft);
+    assert!((95.0..95.5).contains(&live_video(&h.app).position));
+    // Space pauses, Space plays on
+    h.press(Key::Space);
+    assert!(live_video(&h.app).paused);
+    h.press(Key::Space);
+    assert!(!live_video(&h.app).paused);
+    // the slides panel (middle) works the same
+    h.frame(click_at(pos2(700.0, 600.0)));
+    assert_eq!(h.app.service_area, Some(area::Slides));
+    h.press(Key::Space);
+    assert!(live_video(&h.app).paused);
+    // the live panel (right): the live video, whatever is selected
+    h.frame(click_at(pos2(1300.0, 700.0)));
+    assert_eq!(h.app.service_area, Some(area::Live));
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.app.sel_slide = 0;
+    h.press(Key::Space);
+    assert!(!live_video(&h.app).paused);
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    // leaving the tab forgets the click: Space is the next slide again
+    h.app.tab = crate::app::Tab::Songs;
+    h.frame(vec![]);
+    h.app.tab = crate::app::Tab::Service;
+    assert_eq!(h.app.service_area, None);
+    // a selected text item in the list: Space / → are slide keys again
+    h.frame(click_at(pos2(100.0, 450.0)));
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.app.sel_slide = 0;
+    h.press(Key::ArrowRight);
+    assert_eq!(h.app.sel_slide, 1);
+    h.press(Key::Space);
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    // the video keys are not slide-key conflicts in Settings
+    let sc = &h.app.settings.shortcuts;
+    let space = crate::shortcuts::KeyBinding::plain(Key::Space);
+    assert!(sc.conflicts(&space, crate::shortcuts::Action::VideoPlayPause).is_empty());
+    assert!(sc.conflicts(&space, crate::shortcuts::Action::NextSlide).is_empty());
+}
+
+#[test]
+fn default_shortcuts_have_no_conflicts_and_freeze_is_comma() {
+    use crate::shortcuts::{Action, KeyBinding, Shortcuts};
+    let sc = Shortcuts::default();
+    for a in Action::ALL {
+        for b in sc.bindings(*a) {
+            assert!(sc.conflicts(&b, *a).is_empty(), "{a:?} {b}: {:?}", sc.conflicts(&b, *a));
+        }
+    }
+    assert_eq!(sc.bindings(Action::Freeze), vec![KeyBinding::plain(eframe::egui::Key::Comma)]);
+    assert_eq!(
+        KeyBinding::parse(&KeyBinding::plain(eframe::egui::Key::Comma).to_string()),
+        Some(KeyBinding::plain(eframe::egui::Key::Comma))
+    );
+    // a video key on a key that is not a slide key is a real conflict
+    let mut v = Shortcuts::default();
+    v.map.insert(Action::VideoPlayPause, vec![KeyBinding::plain(eframe::egui::Key::Period)]);
+    assert_eq!(v.conflicts(&KeyBinding::plain(eframe::egui::Key::Period), Action::VideoPlayPause), vec![Action::Blank]);
+    // a real conflict is still one
+    let mut sc = Shortcuts::default();
+    sc.map.insert(Action::Freeze, vec![KeyBinding::plain(eframe::egui::Key::Period)]);
+    assert_eq!(sc.conflicts(&KeyBinding::plain(eframe::egui::Key::Period), Action::Freeze), vec![Action::Blank]);
+}
+
+#[test]
+fn ui_service_tab_keys_work_with_a_focused_button() {
+    use crate::app::ItemRef;
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "A".into(), text: "one\n---\ntwo".into() }));
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.frame(vec![]);
+    // Tab focuses a button of the Service tab
+    h.press(Key::Tab);
+    h.frame(vec![]);
+    assert!(h.ctx.memory(|m| m.focused()).is_some(), "a widget has the focus");
+    assert!(!h.ctx.text_edit_focused());
+    // one-letter shortcuts still work
+    h.press(Key::Period);
+    assert!(h.app.blank, "Blank with a focused button");
+    h.press(Key::Comma);
+    assert!(h.app.frozen.is_some(), "Freeze with a focused button");
+    h.press(Key::End);
+    assert_eq!(h.app.sel_slide, 1, "End with a focused button");
+    // ...but not in a text field: the text field gets the keys
+    h.app.blank = false;
+    h.app.frozen = None;
+    let id = eframe::egui::Id::unique("plan_test_text");
+    let mut text = String::new();
+    let run = |h: &mut Harness, events: Vec<eframe::egui::Event>, text: &mut String| {
+        let mut input = eframe::egui::RawInput { events, ..Default::default() };
+        input.screen_rect = Some(eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1400.0, 900.0)));
+        input.focused = true;
+        let app = &mut h.app;
+        let _ = h.ctx.run_ui(input, |ui| {
+            app.frame(ui);
+            eframe::egui::Area::new(eframe::egui::Id::unique("plan_test_area")).show(ui.ctx(), |ui| {
+                let r = ui.add(eframe::egui::TextEdit::singleline(text).id(id));
+                r.request_focus();
+            });
+        });
+    };
+    run(&mut h, vec![], &mut text);
+    run(&mut h, vec![], &mut text);
+    assert!(h.ctx.text_edit_focused());
+    let mut ev = key(Key::Period, eframe::egui::Modifiers::NONE);
+    ev.push(eframe::egui::Event::Text(".".into()));
+    run(&mut h, ev, &mut text);
+    assert!(!h.app.blank, "typing a '.' is no Blank");
+    assert_eq!(text, ".");
+    // other tabs: a focused button still takes the plain keys (as before)
+    h.app.tab = crate::app::Tab::Bible;
+    h.ctx.memory_mut(|m| m.request_focus(eframe::egui::Id::unique("some_button")));
+    assert_eq!(crate::shortcuts::KeyFocus::of(&h.ctx, false), crate::shortcuts::KeyFocus::Text);
+    assert_eq!(crate::shortcuts::KeyFocus::of(&h.ctx, true), crate::shortcuts::KeyFocus::Widget);
 }

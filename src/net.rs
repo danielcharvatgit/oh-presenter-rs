@@ -5,7 +5,7 @@
 //! the current scene, plus the images it uses (sent once per client). Videos are sent
 //! in pieces (`asset_part`), so a large file never has to be in memory at once.
 
-use crate::model::{Alert, Scene};
+use crate::model::{Alert, ClockStyle, Scene};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,10 @@ pub enum ServerMsg {
     /// Start (`Some`) or stop (`None`) an alert over the scene. (Older clients ignore it.)
     Alert {
         alert: Option<Alert>,
+    },
+    /// How to show the clock; each output shows its own computer's time. (Older clients ignore it.)
+    Clock {
+        clock: ClockStyle,
     },
     Ping,
 }
@@ -78,6 +82,7 @@ struct Shared {
     scene: Scene,
     /// The running alert and when it started (for clients connecting meanwhile).
     alert: Option<(Alert, Instant)>,
+    clock: ClockStyle,
     next_id: u64,
 }
 
@@ -124,12 +129,8 @@ fn write_file(w: &mut impl Write, name: &str) -> std::io::Result<()> {
             }
         }
         let last = offset + n as u64 >= len || n < buf.len();
-        let msg = ServerMsg::AssetPart {
-            name: name.into(),
-            offset,
-            data: base64::engine::general_purpose::STANDARD.encode(&buf[..n]),
-            last,
-        };
+        let msg =
+            ServerMsg::AssetPart { name: name.into(), offset, data: base64::engine::general_purpose::STANDARD.encode(&buf[..n]), last };
         w.write_all(serde_json::to_string(&msg).map_err(std::io::Error::other)?.as_bytes())?;
         w.write_all(b"\n")?;
         offset += n as u64;
@@ -142,7 +143,13 @@ fn write_file(w: &mut impl Write, name: &str) -> std::io::Result<()> {
 impl Server {
     /// Starts listening. Errors (port in use...) are kept in `error`, the app keeps working.
     pub fn start(port: u16) -> Self {
-        let shared = Arc::new(Mutex::new(Shared { clients: HashMap::new(), scene: Scene::Blank, alert: None, next_id: 0 }));
+        let shared = Arc::new(Mutex::new(Shared {
+            clients: HashMap::new(),
+            scene: Scene::Blank,
+            alert: None,
+            clock: ClockStyle::default(),
+            next_id: 0,
+        }));
         let mut server = Server { shared: shared.clone(), error: None };
         match TcpListener::bind(("0.0.0.0", port)) {
             Ok(listener) => {
@@ -198,6 +205,20 @@ impl Server {
         }
     }
 
+    /// Sends the clock settings to every client when they changed (cheap to call every frame).
+    pub fn clock(&self, clock: &ClockStyle) {
+        let mut s = self.shared.lock().unwrap();
+        if s.clock == *clock {
+            return;
+        }
+        s.clock = *clock;
+        if let Ok(msg) = serde_json::to_string(&ServerMsg::Clock { clock: *clock }) {
+            for c in s.clients.values_mut() {
+                let _ = c.tx.send(Out::Line(msg.clone()));
+            }
+        }
+    }
+
     pub fn clients(&self) -> Vec<ClientInfo> {
         let mut v: Vec<ClientInfo> = self.shared.lock().unwrap().clients.values().map(|c| c.info.clone()).collect();
         v.sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -235,6 +256,10 @@ fn handle_client(stream: TcpStream, shared: Arc<Mutex<Shared>>) {
                     let _ = client.tx.send(Out::Line(msg));
                 }
             }
+        }
+        // always (also when off): a client that reconnects may still show an older clock
+        if let Ok(msg) = serde_json::to_string(&ServerMsg::Clock { clock: s.clock }) {
+            let _ = client.tx.send(Out::Line(msg));
         }
         s.clients.insert(key, client);
         key
@@ -274,6 +299,7 @@ pub enum ClientEvent {
     /// An image arrived and was stored in the client media directory.
     Asset(String),
     Alert(Option<Alert>),
+    Clock(ClockStyle),
 }
 
 /// A received media name made safe as a file name in the client media folder.
@@ -379,6 +405,9 @@ fn client_session(mut stream: TcpStream, client_id: &str, display_name: &str, tx
             }
             Ok(ServerMsg::Alert { alert }) => {
                 let _ = tx.send(ClientEvent::Alert(alert));
+            }
+            Ok(ServerMsg::Clock { clock }) => {
+                let _ = tx.send(ClientEvent::Clock(clock));
             }
             Ok(ServerMsg::Ping) => {
                 let _ = stream.write_all(format!("{}\n", serde_json::to_string(&ClientMsg::Pong).unwrap()).as_bytes());

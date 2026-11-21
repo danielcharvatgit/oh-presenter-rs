@@ -10,6 +10,7 @@ mod legacy;
 mod service_tab;
 mod settings_tab;
 mod songs_tab;
+mod startup;
 mod video_ctl;
 
 use crate::bible::{Bible, BibleMeta, Bookmarks, Hit};
@@ -22,6 +23,7 @@ use crate::settings::Settings;
 use crate::shortcuts::{self, Action, KeyBinding};
 use crate::storage::{self, Library};
 use eframe::egui::{self, Key, ViewportCommand, ViewportId};
+use keynav::FollowFocus;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -52,6 +54,8 @@ pub enum WriteKind {
     Design(Design),
     Backup,
     LangTemplate,
+    /// A bible (by id) as plain text.
+    BibleTxt(String),
 }
 
 /// What to do after the user resolved an "unsaved changes" question.
@@ -108,6 +112,21 @@ pub enum Dialog {
     /// First word search in a bible: for which language should the index be made?
     /// (the current bible's language is suggested)
     BibleIndexLanguage(String),
+    /// The output is full screen on another screen (the operator does not see it): leave
+    /// full screen / close it only when confirmed here.
+    LeaveOutput(OutputChange),
+}
+
+/// A change of the output window that is confirmed first while it is full screen on
+/// another screen (see [`App::request_output_change`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputChange {
+    /// Out of full screen, into a window.
+    Windowed,
+    /// Close it (it opens full screen again).
+    Close,
+    /// Its own close button (or Alt+F4): closed, and opens as a window next time.
+    CloseButton,
 }
 
 /// Color of the "add" (➕) icons.
@@ -170,16 +189,48 @@ pub struct SongEditor {
     pub new_column: String,
 }
 
+/// Putting the output window full screen on its screen (or a windowed one onto it), step by
+/// step: every step is checked on a later frame of the output window, and tried another way
+/// when the window did not get there (see [`crate::screens::fullscreen_step`]).
+/// The window is never created full screen: created hidden and full screen at once, Windows
+/// left it borderless on the primary screen at its first size (a quarter of the screen).
+pub struct Placing {
+    fullscreen: bool,
+    done: u32,
+    next_at: Instant,
+}
+
+impl Placing {
+    fn new(fullscreen: bool) -> Self {
+        // the first look once the new window has been shown
+        Self { fullscreen, done: 0, next_at: Instant::now() + std::time::Duration::from_millis(120) }
+    }
+}
+
 /// State shared with the output window (a deferred viewport, see [`App::show_output`]).
 pub struct OutputShared {
     scene: Scene,
     alert: Option<(Alert, Instant)>,
+    clock: ClockStyle,
     /// The output window's own texture cache (created on its first frame).
     textures: Option<TextureCache>,
     keys_enabled: bool,
+    /// No mouse pointer over the output (with "keep above all other windows").
+    hide_cursor: bool,
+    /// When the output window was last marked to stay shown during Windows Peek
+    /// (again now and then: a closed and reopened output window is a new window).
+    peek_marked: Option<Instant>,
     shortcuts: shortcuts::Shortcuts,
     mark_keys: MarkKeys,
+    /// The screen the output goes on (its index for egui and the screen itself).
+    target: Option<(usize, crate::screens::Monitor)>,
+    /// The screens (to tell which one the output window is on).
+    monitors: Vec<crate::screens::Monitor>,
+    /// Putting the output window on its screen (see [`Placing`]).
+    placing: Option<Placing>,
     // filled by the output window, handled by the main window
+    /// The screen the output window is on (its middle), as last seen.
+    on_screen: Option<usize>,
     actions: Vec<Action>,
     jump: Option<(String, Option<u32>)>,
     fullscreen: Option<bool>,
@@ -217,6 +268,11 @@ pub struct App {
     pub live: Scene,
     pub live_pos: Option<(ItemRef, usize)>,
     pub blank: bool,
+    /// Freeze: the scene the outputs keep showing (and when its video state was set) while
+    /// `live` goes on changing.
+    pub frozen: Option<(Scene, Instant)>,
+    /// Where in the Service tab was clicked last (for the video keys).
+    pub service_area: Option<service_tab::ServiceArea>,
     pub add_search: String,
 
     pub songs: SongEditor,
@@ -243,6 +299,27 @@ pub struct App {
     video_audio: Option<(u64, crate::video::Audio)>,
     /// Videos being copied into the library and probed in the background.
     video_import: Option<std::sync::mpsc::Receiver<Result<ItemKind, String>>>,
+    /// The library being loaded at the start (the splash screen shows meanwhile).
+    loading: Option<startup::Loading>,
+    /// The screen (index of winit's monitors) the output window goes full screen on.
+    pub output_monitor: Option<usize>,
+    /// Names of the screens found at the start.
+    screen_names: Vec<String>,
+    /// The screens as last looked at (see [`App::refresh_output_monitor`]).
+    monitors: Vec<crate::screens::Monitor>,
+    /// The screen (index into `monitors`) the main window is on.
+    main_monitor: Option<usize>,
+    /// Where to move the main window on its first frame (onto the primary screen).
+    pending_main_position: Option<egui::Pos2>,
+    /// The main window (for its screens); `None` in tests.
+    root_window: Option<std::sync::Arc<winit::window::Window>>,
+    /// Frames left to wait for the screen the main window is on (Wayland knows it only
+    /// once the window is shown); 0 = the windows are placed.
+    placement_tries: u32,
+    /// The output window was open on the last frame (to notice it opening).
+    output_was_open: bool,
+    /// The Service tab's columns on the last frame (for the keyboard, see service_tab).
+    service_cols: service_tab::Columns,
 }
 
 impl App {
@@ -250,29 +327,38 @@ impl App {
         let settings = Settings::load();
         crate::i18n::load_dir(&storage::paths().lang());
         crate::i18n::set_language(&settings.language);
-        let mut app = Self::with_settings(&cc.egui_ctx, settings);
-        if !app.settings.legacy_import_answered {
-            // first run (until answered): look for files of the old oh-presenter
-            app.start_legacy_scan(false);
+        // the window appears right away with the splash screen; the library loads meanwhile
+        let loading = startup::Loading::start(&cc.egui_ctx, settings.bible.clone());
+        let mut app = Self::with_loaded(&cc.egui_ctx, settings, startup::Loaded::empty());
+        app.loading = Some(loading);
+        if let Some(window) = cc.winit_window() {
+            app.place_windows(window);
         }
         app
     }
 
+    /// The app with everything loaded right away (tests).
+    #[cfg(test)]
     pub fn with_settings(ctx: &egui::Context, settings: Settings) -> Self {
+        let loaded = startup::Loaded::load(settings.bible.clone(), &mut |_| {});
+        Self::with_loaded(ctx, settings, loaded)
+    }
+
+    fn with_loaded(ctx: &egui::Context, settings: Settings, loaded: startup::Loaded) -> Self {
         render::install_fonts(ctx, None);
         // Ctrl+Q goes through our own (customisable) Quit action, which asks first
         ctx.options_mut(|o| o.quit_shortcuts.clear());
         ctx.set_visuals(if settings.dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
         let server = settings.network_enabled.then(|| Server::start(settings.network_port));
-        let mut bible = BibleUi {
-            bibles: crate::bible::list_bibles(),
-            current: None,
+        let bible = BibleUi {
+            bibles: loaded.bibles,
+            current: loaded.bible,
             query: String::new(),
             results: vec![],
             selected: vec![],
             last_clicked: None,
             info: String::new(),
-            bookmarks: Bookmarks::load(),
+            bookmarks: loaded.bookmarks,
             book: 0,
             chapter: 0,
             index: None,
@@ -283,11 +369,9 @@ impl App {
             languages_filled: false,
             book_hint: None,
         };
-        let bible_id = settings.bible.clone().or_else(|| bible.bibles.first().map(|b| b.id.clone()));
-        bible.current = bible_id.and_then(|id| Bible::load(&id));
         let design = Design { id: make_id(), name: t("designer.untitled"), doc: CanvasDoc::default() };
         let mut app = Self {
-            lib: Library::load(),
+            lib: loaded.lib,
             tab: Tab::Service,
             service: Service::default(),
             service_path: None,
@@ -299,6 +383,8 @@ impl App {
             live: Scene::Blank,
             live_pos: None,
             blank: false,
+            frozen: None,
+            service_area: None,
             add_search: String::new(),
             songs: SongEditor {
                 song: Self::blank_song(),
@@ -335,6 +421,16 @@ impl App {
             video_since: Instant::now(),
             video_audio: None,
             video_import: None,
+            loading: None,
+            output_monitor: None,
+            screen_names: Vec::new(),
+            monitors: Vec::new(),
+            main_monitor: None,
+            pending_main_position: None,
+            root_window: None,
+            placement_tries: 0,
+            output_was_open: false,
+            service_cols: Default::default(),
             legacy: None,
             alert: None,
             alert_text: String::new(),
@@ -346,14 +442,21 @@ impl App {
             output: std::sync::Arc::new(std::sync::Mutex::new(OutputShared {
                 scene: Scene::Blank,
                 alert: None,
+                clock: settings.clock,
                 textures: None,
                 keys_enabled: true,
+                hide_cursor: false,
+                peek_marked: None,
                 shortcuts: settings.shortcuts.clone(),
                 mark_keys: MarkKeys::default(),
                 actions: Vec::new(),
                 jump: None,
                 fullscreen: None,
                 close: false,
+                target: None,
+                monitors: Vec::new(),
+                placing: None,
+                on_screen: None,
             })),
             settings,
         };
@@ -513,10 +616,50 @@ impl App {
         self.broadcast();
     }
 
+    /// What the outputs show: black while blanked, the frozen scene while frozen, else live.
+    pub fn output_scene(&self) -> Scene {
+        if self.blank {
+            Scene::Blank
+        } else if let Some((scene, _)) = &self.frozen {
+            scene.clone()
+        } else {
+            self.live.clone()
+        }
+    }
+
     pub fn broadcast(&self) {
         if let Some(server) = &self.server {
-            server.broadcast(if self.blank { &Scene::Blank } else { &self.live });
+            server.broadcast(&self.output_scene());
         }
+    }
+
+    /// Freeze on: the outputs keep the current picture while slides are changed. Off: they
+    /// show the live slide again (a live video from where it is now).
+    pub fn toggle_freeze(&mut self) {
+        if self.frozen.take().is_none() {
+            self.frozen = Some((self.live.clone(), self.video_since));
+            self.notify(t("output.frozen_on"));
+            return;
+        }
+        self.notify(t("output.frozen_off"));
+        if matches!(self.live, Scene::Video(_)) {
+            // new playback state from the current position, sent to every output
+            self.video_update(|_| {});
+        } else {
+            self.broadcast();
+        }
+    }
+
+    /// Live mode on / off. Turned on, the selected slide goes live right away (so what is
+    /// selected is what is shown, as live mode promises).
+    pub fn set_live_mode(&mut self, on: bool) {
+        self.settings.live_follows_selection = on;
+        self.save_settings();
+        let selected = self.sel_item.map(|i| (i, self.sel_slide));
+        if on && selected.is_some() && selected != self.live_pos {
+            self.go_live();
+        }
+        self.notify(if on { t("status.live_on") } else { t("status.live_off") });
     }
 
     /// Selects a slide; with live mode on it also goes live.
@@ -541,6 +684,13 @@ impl App {
         if !self.blank {
             // a blanked video pauses (and its sound stops); it goes on with ▶
             self.video_update(|v| v.paused = true);
+            // ...also the one frozen on the output
+            if let Some((Scene::Video(v), since)) = &mut self.frozen {
+                v.position = v.position_after(since.elapsed().as_secs_f64());
+                v.paused = true;
+                v.token = crate::video::next_token();
+                *since = Instant::now();
+            }
         }
         self.blank = !self.blank;
         self.broadcast();
@@ -795,12 +945,12 @@ impl App {
             files::Purpose::ImportLegacy => self.import_legacy_files(chosen),
             files::Purpose::DesignerAddImage => {
                 if let Some(media) = self.store_image(&first) {
-                    self.designer_add(ObjectKind::Image { media });
+                    self.designer_add(ObjectKind::Image { media, opacity: 1.0 });
                 }
             }
             files::Purpose::DesignerReplaceImage(id) => {
                 if let Some(m) = self.store_image(&first)
-                    && let Some(ObjectKind::Image { media }) =
+                    && let Some(ObjectKind::Image { media, .. }) =
                         self.designer.design.doc.objects.iter_mut().find(|o| o.id == id).map(|o| &mut o.kind)
                 {
                     *media = m;
@@ -869,6 +1019,12 @@ impl App {
             WriteKind::LangTemplate => storage::write_atomic(&path, crate::i18n::BUILTIN_EN.as_bytes(), true)
                 .map(|_| tf("export.done", &[("file", &file)]))
                 .map_err(|e| e.to_string()),
+            WriteKind::BibleTxt(id) => match Bible::load(id) {
+                Some(b) => storage::write_atomic(&path, b.to_txt().as_bytes(), true)
+                    .map(|_| tf("export.done", &[("file", &file)]))
+                    .map_err(|e| e.to_string()),
+                None => Err(t("bible.none")),
+            },
         };
         match result {
             Ok(msg) => self.notify(msg),
@@ -1087,9 +1243,19 @@ impl App {
 
     pub fn import_bible(&mut self) {
         self.open_file_dialog(
-            files::Spec::new(files::Mode::PickFiles, t("import.bible")).filter(t("file.bible_filter"), &["xml", "osis", "zef", "sqlite"]),
+            files::Spec::new(files::Mode::PickFiles, t("import.bible"))
+                .filter(t("file.bible_filter"), &["xml", "osis", "zef", "sqlite", "txt"]),
             files::Purpose::ImportBible,
         );
+    }
+
+    /// Exports the current bible as plain text (it can be imported again).
+    pub fn export_bible_txt(&mut self) {
+        let Some(b) = &self.bible.current else {
+            return self.notify(t("bible.no_bible"));
+        };
+        let name = format!("{}.txt", storage::safe_file_name(&b.meta.name));
+        self.export_to(WriteKind::BibleTxt(b.meta.id.clone()), &name, &t("file.text_filter"), "txt");
     }
 
     fn import_bible_files(&mut self, files: Vec<PathBuf>) {
@@ -1150,17 +1316,37 @@ impl App {
                 Action::NextItem => self.step_item(true),
                 Action::PrevItem => self.step_item(false),
                 Action::GoLive => self.go_live(),
-                Action::ToggleLive => {
-                    self.settings.live_follows_selection = !self.settings.live_follows_selection;
-                    self.save_settings();
-                }
+                Action::ToggleLive => self.set_live_mode(!self.settings.live_follows_selection),
                 Action::Blank => self.toggle_blank(),
-                Action::ToggleOutput => self.output_open = !self.output_open,
+                Action::Freeze => self.toggle_freeze(),
+                Action::VideoPlayPause => {
+                    if let Some(target) = self.video_key_target() {
+                        self.video_play_pause(target);
+                    }
+                }
+                Action::VideoForward | Action::VideoBack => {
+                    // a video that is not live has no position: the key does nothing
+                    if self.video_key_target() == Some(video_ctl::VideoTarget::Live) {
+                        let step = if a == Action::VideoForward { video_ctl::VIDEO_SEEK_STEP } else { -video_ctl::VIDEO_SEEK_STEP };
+                        self.video_seek(step);
+                    }
+                }
+                Action::ToggleOutput => {
+                    if self.output_open {
+                        self.request_output_change(OutputChange::Close, ctx);
+                    } else {
+                        self.output_open = true;
+                    }
+                }
                 Action::Alert => self.open_alert_dialog(),
                 Action::OutputFullscreen => {
-                    self.output_open = true;
-                    self.output_fullscreen = !self.output_fullscreen;
-                    ctx.send_viewport_cmd_to(output_id(), ViewportCommand::Fullscreen(self.output_fullscreen));
+                    if self.output_open && self.output_fullscreen {
+                        self.request_output_change(OutputChange::Windowed, ctx);
+                    } else {
+                        self.output_open = true;
+                        self.output_fullscreen = !self.output_fullscreen;
+                        self.send_output_fullscreen(ctx);
+                    }
                 }
                 Action::Find => {
                     if self.tab == Tab::Service || self.tab == Tab::Settings {
@@ -1190,6 +1376,7 @@ impl App {
         match a {
             Action::PinPassage => self.tab == Tab::Bible,
             Action::Undo | Action::Redo => self.tab == Tab::Designer,
+            Action::VideoPlayPause | Action::VideoForward | Action::VideoBack => self.video_key_target().is_some(),
             // arrow keys move objects in the designer
             a if a.is_navigation() => self.presenting(),
             _ => true,
@@ -1202,15 +1389,16 @@ impl App {
             return;
         }
         let shortcuts = self.settings.shortcuts.clone();
-        let actions = shortcuts.triggered(ctx, |a| self.action_enabled(a));
+        // in the Service tab a focused button, list row… keeps only the keys it uses itself
+        let focus = shortcuts::KeyFocus::of(ctx, self.tab == Tab::Service);
+        let actions = shortcuts.triggered(ctx, focus, |a| self.action_enabled(a));
         if !actions.is_empty() {
             // a shortcut (Ctrl+1, F5, …) closes an open menu, as in other programs
             egui::Popup::close_all(ctx);
         }
         self.handle_actions(actions, ctx);
         if self.presenting()
-            && !ctx.egui_wants_keyboard_input()
-            && let Some((code, n)) = self.mark_keys().consume(ctx)
+            && let Some((code, n)) = self.mark_keys().consume(ctx, focus)
         {
             egui::Popup::close_all(ctx);
             self.jump_to_mark(&code, n);
@@ -1250,12 +1438,28 @@ impl App {
     /// each paint waited for that window's vsync, so with two windows — on two screens
     /// — every frame waited twice and the whole program crawled.)
     fn show_output(&mut self, ctx: &egui::Context) {
+        let opening = self.output_open && !self.output_was_open;
+        self.output_was_open = self.output_open;
         if !self.output_open {
             return;
         }
-        let scene = if self.blank { Scene::Blank } else { self.live.clone() };
+        if opening {
+            // a projector may have been plugged in or out since the screens were looked at;
+            // also a windowed output (F5) opens on the output's screen
+            self.refresh_output_monitor();
+        }
+        let scene = self.output_scene();
+        let mut save = false;
         let (actions, jump, fullscreen, close) = {
             let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
+            if opening {
+                // a new window: mark it for Peek on its first frame
+                o.peek_marked = None;
+                o.placing = Some(Placing::new(self.output_fullscreen));
+                o.on_screen = None;
+            }
+            o.target = self.output_monitor.and_then(|i| self.monitors.get(i).cloned().map(|m| (i, m)));
+            o.monitors.clone_from(&self.monitors);
             if o.scene != scene {
                 o.scene = scene;
                 ctx.request_repaint_of(output_id());
@@ -1265,83 +1469,175 @@ impl App {
                 o.alert = alert.map(|a| (a.clone(), Instant::now()));
                 ctx.request_repaint_of(output_id());
             }
+            if o.clock != self.settings.clock {
+                o.clock = self.settings.clock;
+                ctx.request_repaint_of(output_id());
+            }
             o.keys_enabled = self.capture.is_none() && self.dialog.is_none() && self.file_dialog.is_none();
+            // a window (not full screen) shows the pointer, so it can be moved and resized
+            o.hide_cursor = self.settings.output_always_on_top && self.output_fullscreen;
             o.shortcuts = self.settings.shortcuts.clone();
             o.mark_keys = self.mark_keys();
+            // remember the screen the output was shown on (it opens there next time)
+            if let Some(i) = o.on_screen
+                && Some(i) != self.main_monitor
+                && let Some(m) = self.monitors.get(i)
+                && self.settings.output_screen.as_ref() != Some(&crate::screens::ScreenId::of(m))
+            {
+                self.settings.output_screen = Some(crate::screens::ScreenId::of(m));
+                // saved below, once the output's state is let go
+                save = true;
+            }
             (std::mem::take(&mut o.actions), o.jump.take(), o.fullscreen.take(), std::mem::take(&mut o.close))
         };
+        if save {
+            self.save_settings();
+        }
         let shared = self.output.clone();
-        ctx.show_viewport_deferred(
-            output_id(),
-            egui::ViewportBuilder::default().with_title(t("output.title")).with_inner_size([960.0, 540.0]).with_window_level(
-                if self.settings.output_always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
-            ),
-            move |ui, _class| {
-                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-                let o = &mut *guard;
-                let vctx = ui.ctx().clone();
-                vctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
-                let rect = ui.max_rect();
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-                let textures = o.textures.get_or_insert_with(|| TextureCache::new(storage::paths().media()));
-                let slide = render::fit_16_9(rect);
-                render::draw_scene_live(&painter, slide, &o.scene, textures);
-                if let Some((alert, since)) = &o.alert
-                    && render::draw_alert(&painter, slide, alert, since.elapsed().as_secs_f32())
-                {
-                    // ~60 frames per second while it runs
-                    vctx.request_repaint_after(std::time::Duration::from_millis(16));
-                }
-                let mut wake_main = false;
-                // double click toggles fullscreen, Esc leaves it
-                let resp = ui.interact(rect, egui::Id::unique("output_area"), egui::Sense::click());
-                if resp.double_clicked() {
-                    o.fullscreen = Some(true);
+        let title = t("output.title");
+        // created as an ordinary window, then put on its screen (see Placing)
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size([960.0, 540.0])
+            .with_window_level(if self.settings.output_always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
+        ctx.show_viewport_deferred(output_id(), builder, move |ui, _class| {
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let o = &mut *guard;
+            let vctx = ui.ctx().clone();
+            vctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
+            let rect = ui.max_rect();
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+            let textures = o.textures.get_or_insert_with(|| TextureCache::new(storage::paths().media()));
+            let slide = render::fit_16_9(rect);
+            render::draw_scene_live(&painter, slide, &o.scene, textures);
+            if let Some((alert, since)) = &o.alert
+                && render::draw_alert(&painter, slide, alert, since.elapsed().as_secs_f32())
+            {
+                // ~60 frames per second while it runs
+                vctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+            if o.clock.show {
+                let secs = crate::clock::now_secs();
+                crate::clock::draw(&painter, rect, slide.width(), &o.clock, secs);
+                vctx.request_repaint_after(crate::clock::repaint_in(&o.clock, secs));
+            }
+            let mut wake_main = false;
+            // double click toggles fullscreen, Esc leaves it
+            let resp = ui.interact(rect, egui::Id::unique("output_area"), egui::Sense::click());
+            if resp.double_clicked() {
+                o.fullscreen = Some(true);
+                wake_main = true;
+            }
+            if vctx.input(|i| i.key_pressed(Key::Escape)) {
+                o.fullscreen = Some(false);
+                wake_main = true;
+            }
+            if vctx.input(|i| i.viewport().close_requested()) {
+                o.close = true;
+                wake_main = true;
+            }
+            if o.keys_enabled && vctx.input(|i| i.focused) {
+                let focus = shortcuts::KeyFocus::of(&vctx, false);
+                let actions = o
+                    .shortcuts
+                    .triggered(&vctx, focus, |a| a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen));
+                if let Some(j) = o.mark_keys.consume(&vctx, shortcuts::KeyFocus::None) {
+                    o.jump = Some(j);
                     wake_main = true;
                 }
-                if vctx.input(|i| i.key_pressed(Key::Escape)) {
-                    o.fullscreen = Some(false);
+                if !actions.is_empty() {
+                    o.actions.extend(actions);
                     wake_main = true;
                 }
-                if vctx.input(|i| i.viewport().close_requested()) {
-                    o.close = true;
-                    wake_main = true;
+            }
+            // Windows Peek (the taskbar previews) must not hide the projected picture
+            if o.peek_marked.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2)) {
+                o.peek_marked = crate::peek::keep_shown(&title).then(Instant::now);
+                if o.peek_marked.is_none() {
+                    vctx.request_repaint_after(std::time::Duration::from_millis(200));
                 }
-                if o.keys_enabled && vctx.input(|i| i.focused) {
-                    let actions =
-                        o.shortcuts.triggered(&vctx, |a| a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen));
-                    if let Some(j) = o.mark_keys.consume(&vctx) {
-                        o.jump = Some(j);
-                        wake_main = true;
-                    }
-                    if !actions.is_empty() {
-                        o.actions.extend(actions);
-                        wake_main = true;
-                    }
-                }
-                if wake_main {
-                    // the main window does the work (and sends the new slide back here)
-                    vctx.request_repaint_of(ViewportId::ROOT);
-                }
-            },
-        );
+            }
+            place_output_window(o, &vctx);
+            if o.hide_cursor {
+                // the pointer would show on the projector when moved over to it
+                vctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+            if wake_main {
+                // the main window does the work (and sends the new slide back here)
+                vctx.request_repaint_of(ViewportId::ROOT);
+            }
+        });
         self.handle_actions(actions, ctx);
         if let Some((code, n)) = jump {
             self.jump_to_mark(&code, n);
         }
         match fullscreen {
-            Some(true) => self.output_fullscreen = !self.output_fullscreen,
-            Some(false) => self.output_fullscreen = false,
-            None => {}
-        }
-        if fullscreen.is_some() {
-            ctx.send_viewport_cmd_to(output_id(), ViewportCommand::Fullscreen(self.output_fullscreen));
+            // double click on a window: full screen
+            Some(true) if !self.output_fullscreen => {
+                self.output_fullscreen = true;
+                self.send_output_fullscreen(ctx);
+            }
+            // double click or Esc on the full screen output: out of it (asked first when
+            // it is on another screen)
+            Some(_) if self.output_fullscreen => self.request_output_change(OutputChange::Windowed, ctx),
+            _ => {}
         }
         if close {
-            self.output_open = false;
-            self.output_fullscreen = false;
+            // a child window stays open as long as it is shown: not closing = cancelled
+            self.request_output_change(OutputChange::CloseButton, ctx);
         }
+    }
+
+    /// The output window is full screen on another screen than the program's, where the
+    /// operator does not see it.
+    pub fn output_on_other_screen(&self) -> bool {
+        self.output_open && self.output_fullscreen && self.output_monitor.is_some() && self.output_monitor != self.main_monitor
+    }
+
+    /// Leaves full screen / closes the output window; while it is full screen on another
+    /// screen, a dialog in the main window asks first (a stray key on the projector window
+    /// must not show the desktop to everybody).
+    pub fn request_output_change(&mut self, change: OutputChange, ctx: &egui::Context) {
+        if !self.output_on_other_screen() {
+            return self.apply_output_change(change, ctx);
+        }
+        if self.dialog.is_none() {
+            self.dialog = Some(Dialog::LeaveOutput(change));
+            // the question is in the main window: bring it to the front
+            ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Focus);
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub fn apply_output_change(&mut self, change: OutputChange, ctx: &egui::Context) {
+        match change {
+            OutputChange::Windowed => {
+                self.output_fullscreen = false;
+                self.send_output_fullscreen(ctx);
+            }
+            OutputChange::Close => self.output_open = false,
+            OutputChange::CloseButton => {
+                self.output_open = false;
+                self.output_fullscreen = false;
+            }
+        }
+    }
+
+    /// Applies `output_fullscreen` to the output window: full screen on the output's screen
+    /// when there is one, else on the screen the window is on (done step by step by the
+    /// output window itself, see [`Placing`]).
+    fn send_output_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.output_fullscreen {
+            // a projector may have been plugged in or out since the start
+            self.refresh_output_monitor();
+        }
+        let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        o.target = self.output_monitor.and_then(|i| self.monitors.get(i).cloned().map(|m| (i, m)));
+        o.monitors.clone_from(&self.monitors);
+        o.placing = Some(Placing { next_at: Instant::now(), ..Placing::new(self.output_fullscreen) });
+        drop(o);
+        ctx.request_repaint_of(output_id());
     }
 
     // -----------------------------------------------------------------------
@@ -1581,6 +1877,18 @@ impl App {
                 Dialog::BibleIndexLanguage(suggested) => {
                     self.bible_index_dialog(ui, suggested, &mut close);
                 }
+                Dialog::LeaveOutput(change) => {
+                    let windowed = *change == OutputChange::Windowed;
+                    ui.heading(t(if windowed { "dialog.output_leave" } else { "dialog.output_close" }));
+                    ui.label(t("dialog.output_other_screen"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let (change, c) = (*change, ctx.clone());
+                        let yes = t(if windowed { "dialog.output_leave_yes" } else { "dialog.output_close_yes" });
+                        btn(ui, yes, Some(Box::new(move |app| app.apply_output_change(change, &c))));
+                        btn(ui, t("cancel"), None);
+                    });
+                }
                 Dialog::DeleteBible(id) => {
                     let name = self.bible.bibles.iter().find(|b| &b.id == id).map(|b| b.name.clone()).unwrap_or_default();
                     ui.label(tf("dialog.delete_bible", &[("name", &name)]));
@@ -1700,6 +2008,13 @@ impl App {
                             files::Purpose::ExportAllSongs,
                         );
                     }
+                    if ui
+                        .add_enabled(self.bible.current.is_some(), egui::Button::new(t("export.bible")))
+                        .on_hover_text(t("export.bible_hint"))
+                        .clicked()
+                    {
+                        self.export_bible_txt();
+                    }
                     ui.separator();
                     if ui.button(t("export.backup")).on_hover_text(t("export.backup_hint")).clicked() {
                         self.export_to(
@@ -1720,7 +2035,7 @@ impl App {
                     self.open_alert_dialog();
                 }
                 if item(ui, t("output.toggle"), Some(Action::ToggleOutput)) {
-                    self.output_open = !self.output_open;
+                    self.handle_actions(vec![Action::ToggleOutput], &ui.ctx().clone());
                 }
                 if item(ui, t("output.fullscreen"), Some(Action::OutputFullscreen)) {
                     self.handle_actions(vec![Action::OutputFullscreen], &ui.ctx().clone());
@@ -1728,11 +2043,20 @@ impl App {
                 if item(ui, t("output.blank"), Some(Action::Blank)) {
                     self.toggle_blank();
                 }
+                let freeze = if self.frozen.is_some() { format!("✔ {}", t("output.freeze")) } else { t("output.freeze") };
+                if item(ui, freeze, Some(Action::Freeze)) {
+                    self.toggle_freeze();
+                }
                 ui.separator();
                 if ui.button(t("output.start_client")).on_hover_text(t("output.start_client_hint")).clicked() {
                     self.start_local_client();
                 }
             });
+            // Alt+1 / Alt+2 open the menus (see keynav: a number alone picks the n-th item)
+            self.alt_nav.menu_button_ids = vec![file_menu.response.id, output_menu.response.id];
+            for (n, m) in [&file_menu, &output_menu].into_iter().enumerate() {
+                m.response.clone().on_hover_text(tf("menu.shortcut_hint", &[("key", &format!("Alt+{}", n + 1))]));
+            }
             self.alt_nav.menu_ids = [
                 Some(egui::Popup::default_response_id(&file_menu.response)),
                 Some(egui::Popup::default_response_id(&output_menu.response)),
@@ -1741,8 +2065,11 @@ impl App {
             if let Some(m) = open_menu {
                 let r = if m == 0 { &file_menu.response } else { &output_menu.response };
                 egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(r));
+                // Tab (or ↓) then goes on to the menu's first item
+                r.request_focus();
             }
             ui.separator();
+            self.alt_nav.tab_ids.clear();
             for (tab, key, action) in [
                 (Tab::Service, "tab.service", Action::TabService),
                 (Tab::Songs, "tab.songs", Action::TabSongs),
@@ -1757,7 +2084,9 @@ impl App {
                 {
                     label.push_str(" •");
                 }
-                if ui.selectable_label(self.tab == tab, label).on_hover_text(sc.describe(action)).clicked() {
+                let r = ui.selectable_label(self.tab == tab, label).on_hover_text(sc.describe(action));
+                self.alt_nav.tab_ids.push((tab, r.id));
+                if r.clicked() {
                     self.tab = tab;
                 }
             }
@@ -1778,6 +2107,10 @@ impl App {
             ui.separator();
             if self.blank {
                 ui.colored_label(LIVE_COLOR, t("status.blank"));
+                ui.separator();
+            }
+            if self.frozen.is_some() {
+                ui.colored_label(LIVE_COLOR, t("status.frozen")).on_hover_text(t("output.freeze_hint"));
                 ui.separator();
             }
             self.alert_status(ui);
@@ -1806,6 +2139,66 @@ impl App {
     }
 }
 
+/// Runs in the output window (each of its frames): the next step of putting it on its
+/// screen, once the last step had time to take effect. Every step is written to start.log.
+fn place_output_window(o: &mut OutputShared, vctx: &egui::Context) {
+    use crate::screens::{self, Seen, Step};
+    let ppp = vctx.pixels_per_point();
+    let phys = |v: f32| (v * ppp).round();
+    let seen = vctx.input(|i| {
+        let v = i.viewport();
+        Seen {
+            outer: v.outer_rect.map(|r| (phys(r.min.x) as i32, phys(r.min.y) as i32, phys(r.width()) as u32, phys(r.height()) as u32)),
+            inner_size: v.inner_rect.map(|r| (phys(r.width()) as u32, phys(r.height()) as u32)),
+            fullscreen: v.fullscreen,
+        }
+    });
+    // which screen it is on (to remember it)
+    if let Some((x, y, w, h)) = seen.outer {
+        o.on_screen = o.monitors.iter().position(|m| screens::contains(m, (x + w as i32 / 2, y + h as i32 / 2)));
+    }
+    let Some(p) = &mut o.placing else { return };
+    let now = Instant::now();
+    if now < p.next_at {
+        vctx.request_repaint_after(p.next_at - now);
+        return;
+    }
+    let target = o.target.as_ref();
+    let step = match (target, p.fullscreen) {
+        (Some((_, m)), true) => screens::fullscreen_step(m, &seen, p.done),
+        // one screen: full screen where it is
+        (None, true) => (seen.fullscreen != Some(true) && p.done < 3).then_some(Step::EnterFullscreen),
+        (m, false) => screens::windowed_step(m.map(|(_, m)| m), &seen, p.done),
+    };
+    let what = format!("output window: {seen:?}, target {:?}", target.map(|(i, m)| (i, &m.name, m.pos, m.size)));
+    let Some(step) = step else {
+        crate::log_info(&format!("{what}: placed after {} steps", p.done));
+        o.placing = None;
+        return;
+    };
+    if p.done >= screens::MAX_STEPS {
+        crate::log_info(&format!("{what}: not placed after {} steps, giving up", p.done));
+        o.placing = None;
+        return;
+    }
+    crate::log_info(&format!("{what}: step {} {step:?}", p.done + 1));
+    let cmd = match step {
+        Step::SetMonitor => match target {
+            Some((i, _)) => ViewportCommand::SetMonitor(*i),
+            None => ViewportCommand::Fullscreen(true),
+        },
+        Step::LeaveFullscreen => ViewportCommand::Fullscreen(false),
+        // egui takes points of this window (its own scale) and makes physical pixels of them
+        Step::MoveTo((x, y)) => ViewportCommand::OuterPosition(egui::pos2(x as f32 / ppp, y as f32 / ppp)),
+        Step::EnterFullscreen => ViewportCommand::Fullscreen(true),
+    };
+    vctx.send_viewport_cmd(cmd);
+    p.done += 1;
+    // a move to a screen with another scale, or a full screen switch, takes a moment
+    p.next_at = now + std::time::Duration::from_millis(250);
+    vctx.request_repaint_after(std::time::Duration::from_millis(260));
+}
+
 /// Keys that jump to marked song parts (and number keys to verses).
 #[derive(Default)]
 struct MarkKeys {
@@ -1814,11 +2207,15 @@ struct MarkKeys {
 }
 
 impl MarkKeys {
-    fn consume(&self, ctx: &egui::Context) -> Option<(String, Option<u32>)> {
+    /// The mark key pressed this frame; keys the focused widget gets (`focus`) are left to it.
+    fn consume(&self, ctx: &egui::Context, focus: shortcuts::KeyFocus) -> Option<(String, Option<u32>)> {
+        if focus == shortcuts::KeyFocus::Text {
+            return None;
+        }
         let mut jump = None;
         ctx.input_mut(|i| {
             for (code, key) in &self.marks {
-                if key.consume(i) {
+                if !focus.takes(key) && key.consume(i) {
                     jump = Some((code.clone(), None));
                 }
             }
@@ -1849,12 +2246,16 @@ pub fn output_id() -> ViewportId {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.root_window.is_none() {
+            self.root_window = frame.winit_window().cloned();
+        }
         self.frame(ui);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.menu_arrows_as_tab(ctx, raw_input);
+        self.tab_from_current_tab(ctx, raw_input);
     }
 }
 
@@ -1863,6 +2264,22 @@ impl App {
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.limit_frame_rate();
+        if !crate::start_guard::frame() {
+            // the start is confirmed a few frames in (see start_guard)
+            ctx.request_repaint();
+        }
+        self.retry_placement(&ctx);
+        if let Some(pos) = self.pending_main_position.take() {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        }
+        if self.poll_loading() {
+            // the projector goes black right away; the program shows after loading
+            self.show_output(&ctx);
+            if let Some(loading) = &mut self.loading {
+                loading.show(ui);
+            }
+            return;
+        }
 
         ctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
 
@@ -1881,14 +2298,23 @@ impl App {
         self.poll_legacy_scan(&ctx);
         self.poll_indexing(&ctx);
         self.poll_alert(&ctx);
+        if let Some(server) = &self.server {
+            server.clock(&self.settings.clock);
+        }
         self.poll_video_import(&ctx);
         self.sync_video_audio();
+        if self.tab != Tab::Service {
+            // the video keys follow a click in the Service tab, made again after coming back
+            self.service_area = None;
+        }
         if self.tab != Tab::Settings {
             // a key capture started in Settings must not keep swallowing keys elsewhere
             self.capture = None;
         }
         self.show_output(&ctx);
         if ctx.input(|i| i.focused) {
+            self.video_keys(&ctx);
+            self.service_column_keys(&ctx);
             self.handle_keys(&ctx);
         }
         // after the shortcuts (an Alt shortcut someone set up still works), before the UI
@@ -1924,6 +2350,48 @@ impl App {
 }
 
 #[cfg(test)]
+impl App {
+    /// Panel ids of the Service tab's left and right column.
+    pub fn service_panel_ids(&self) -> Option<(egui::Id, egui::Id)> {
+        self.service_cols.panels()
+    }
+    /// The id of the live video's preview (it takes Space / ← →).
+    pub fn video_preview_id_for_test() -> egui::Id {
+        Self::video_preview_id()
+    }
+
+    /// As if the output window reported a double click (`Some(true)`), Esc (`Some(false)`)
+    /// or its close button; handled on the next frame.
+    pub fn output_reports(&self, fullscreen: Option<bool>, close: bool) {
+        let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        o.fullscreen = fullscreen;
+        o.close = close;
+    }
+
+    /// Whether the output window hides the mouse pointer (as set on the last frame).
+    pub fn output_hides_cursor(&self) -> bool {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).hide_cursor
+    }
+
+    /// The screens: output full screen on `output`, the program on `main`.
+    pub fn set_screens(&mut self, main: Option<usize>, output: Option<usize>) {
+        self.main_monitor = main;
+        self.output_monitor = output;
+    }
+}
+
+#[cfg(test)]
 pub fn settings_tab_capture(a: Action) -> settings_tab::Capture {
     settings_tab::Capture::Action(a)
 }
+
+#[cfg(test)]
+pub fn startup_load(progress: &mut dyn FnMut(f32)) -> startup::Loaded {
+    startup::load_for_test(progress)
+}
+
+#[cfg(test)]
+pub use startup::fraction as startup_fraction;
+
+#[cfg(test)]
+pub use service_tab::ServiceArea;

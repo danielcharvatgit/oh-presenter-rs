@@ -8,6 +8,11 @@
 //!   shows all items. Esc cancels.
 //! * **Scrolling** the Songs and Settings tabs with ↑ ↓ PgUp PgDn Home End (in the other
 //!   tabs these keys present slides or move designer objects).
+//! * **Tab / Shift+Tab** move the keyboard focus, starting at the open tab in the top bar
+//!   (from Bible, Tab goes on to Settings and the Bible tab's controls, Shift+Tab back to
+//!   Slide designer, Songs, Service, Output): the focused item gets a clear frame, a
+//!   list scrolls to it when it is out of view ([`FollowFocus`]), and an open menu closes
+//!   when the focus leaves it for the page behind it.
 
 use super::{App, Tab};
 use crate::i18n::t;
@@ -40,6 +45,53 @@ pub struct AltNav {
     /// Popup ids of the File and Output menus (from the last frame), see
     /// [`App::menu_arrows_as_tab`].
     pub menu_ids: [Option<egui::Id>; 2],
+    /// The focused widget at the end of the last frame (to notice when Tab moved it).
+    pub last_focus: Option<egui::Id>,
+    /// Ids of the tab labels in the top bar (from the last frame).
+    pub tab_ids: Vec<(Tab, egui::Id)>,
+    /// Ids of the File and Output menu buttons (from the last frame).
+    pub menu_button_ids: Vec<egui::Id>,
+}
+
+/// Where (last frame) the widget just focused with the keyboard is, while it is not fully
+/// in view: the scroll area holding it scrolls there ([`FollowFocus`]).
+fn follow_focus_id() -> egui::Id {
+    egui::Id::unique("keynav_follow_focus")
+}
+
+/// [`egui::ScrollArea::show`] that also scrolls to the widget focused with Tab when that
+/// widget is in this area but out of view (egui itself leaves it hidden).
+pub trait FollowFocus {
+    fn show_following_focus<R>(
+        self,
+        ui: &mut egui::Ui,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::scroll_area::ScrollAreaOutput<R>;
+}
+
+impl FollowFocus for egui::ScrollArea {
+    fn show_following_focus<R>(
+        self,
+        ui: &mut egui::Ui,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::scroll_area::ScrollAreaOutput<R> {
+        self.show(ui, |ui| {
+            let r = add_contents(ui);
+            scroll_to_focus(ui);
+            r
+        })
+    }
+}
+
+/// Called at the end of a scroll area's contents: when the widget to follow lies in them
+/// (an inner scroll area has already taken it otherwise), scrolls this area to it.
+fn scroll_to_focus(ui: &egui::Ui) {
+    let id = follow_focus_id();
+    let Some(rect) = ui.ctx().data(|d| d.get_temp::<egui::Rect>(id)) else { return };
+    if ui.min_rect().expand(2.0).contains_rect(rect) {
+        ui.ctx().data_mut(|d| d.remove::<egui::Rect>(id));
+        ui.scroll_to_rect(rect, None);
+    }
 }
 
 /// A scroll asked for with the keyboard, applied by the tab's scroll area.
@@ -154,6 +206,45 @@ impl App {
         self.alt_nav.keyboard_focus |= raw.events.iter().any(|e| matches!(e, Event::Key { key: Key::Tab, pressed: true, .. }));
     }
 
+    /// Tab / Shift+Tab with nothing focused: start from the open tab's label in the top bar
+    /// (egui would start at the first or last widget of the whole window). Runs on the raw
+    /// input, so egui moves the focus on from that label in the same frame.
+    pub fn tab_from_current_tab(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let tab = raw.events.iter().find_map(|e| match e {
+            Event::Key { key: Key::Tab, pressed: true, modifiers, .. } if !modifiers.ctrl && !modifiers.alt && !modifiers.command => {
+                Some(modifiers.shift)
+            }
+            _ => None,
+        });
+        let Some(back) = tab else { return };
+        if self.dialog.is_some()
+            || self.dialog.is_some()
+            || self.file_dialog.is_some()
+            || egui::Popup::is_any_open(ctx)
+            || ctx.memory(|m| m.focused()).is_some()
+        {
+            return;
+        }
+        // the bar in its order: File, Output, the tabs
+        let bar: Vec<egui::Id> =
+            self.alt_nav.menu_button_ids.iter().copied().chain(self.alt_nav.tab_ids.iter().map(|(_, id)| *id)).collect();
+        let Some(at) = self.alt_nav.tab_ids.iter().find(|(t, _)| *t == self.tab).and_then(|(_, id)| bar.iter().position(|b| b == id))
+        else {
+            return;
+        };
+        if back {
+            // egui does not step back from a focus set in the same frame: go to the item
+            // before the open tab here, and the Tab press is used up
+            let Some(prev) = at.checked_sub(1).map(|i| bar[i]) else { return };
+            ctx.memory_mut(|m| m.request_focus(prev));
+            raw.events.retain(|e| !matches!(e, Event::Key { key: Key::Tab, .. }));
+            self.alt_nav.keyboard_focus = true;
+        } else {
+            // egui moves on from the open tab to the next item in this frame
+            ctx.memory_mut(|m| m.request_focus(bar[at]));
+        }
+    }
+
     /// Collects Alt + letters (before the UI runs, so text fields do not get them) and
     /// acts when Alt is released.
     pub fn alt_navigation(&mut self, ctx: &egui::Context) {
@@ -253,6 +344,10 @@ impl App {
     /// A clear frame around the widget focused with the keyboard (Tab / Shift+Tab);
     /// egui itself only draws such a widget a little darker. Shown from a Tab press
     /// until the mouse is clicked.
+    ///
+    /// When Tab moved the focus: a widget out of view is scrolled into view on the next
+    /// frame ([`FollowFocus`]), and an open menu (or other popup) closes when the focus
+    /// went to the page behind it.
     pub fn keyboard_focus_frame(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             if i.events.iter().any(|e| matches!(e, Event::Key { key: Key::Tab, pressed: true, .. })) {
@@ -262,10 +357,31 @@ impl App {
                 self.alt_nav.keyboard_focus = false;
             }
         });
+        // a scroll asked for on the last frame that no scroll area took
+        ctx.data_mut(|d| d.remove::<egui::Rect>(follow_focus_id()));
+        let focused = ctx.memory(|m| m.focused());
+        let moved = focused.is_some() && focused != self.alt_nav.last_focus;
+        // the focus came from another widget (not from nothing: the first Tab starts at the top)
+        let moved_on = moved && self.alt_nav.last_focus.is_some();
+        self.alt_nav.last_focus = focused;
         if !self.alt_nav.keyboard_focus {
             return;
         }
-        let Some(resp) = ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)) else { return };
+        let Some(resp) = focused.and_then(|id| ctx.read_response(id)) else { return };
+        if moved {
+            let in_popup = matches!(resp.layer_id.order, egui::Order::Foreground | egui::Order::Tooltip);
+            // the button that opened the menu comes right before its items: the menu stays
+            let opener = egui::Popup::is_id_open(ctx, resp.id.with("popup"));
+            if moved_on && !in_popup && !opener && egui::Popup::is_any_open(ctx) {
+                egui::Popup::close_all(ctx);
+                ctx.request_repaint();
+            }
+            // partly or wholly clipped away by its scroll area
+            if resp.interact_rect != resp.rect {
+                ctx.data_mut(|d| d.insert_temp(follow_focus_id(), resp.rect));
+                ctx.request_repaint();
+            }
+        }
         let rect = resp.interact_rect.expand(2.0);
         if !rect.is_positive() {
             return;
@@ -333,7 +449,11 @@ impl App {
             Some(y) => area.vertical_scroll_offset(y.clamp(0.0, max.max(0.0))),
             None => area,
         };
-        let out = area.id_salt(name).show(ui, |ui| add_contents(self, ui));
+        let out = area.id_salt(name).show(ui, |ui| {
+            let r = add_contents(self, ui);
+            scroll_to_focus(ui);
+            r
+        });
         let max = (out.content_size.y - out.inner_rect.height()).max(0.0);
         self.scroll_pos.insert(name, (out.state.clamped_offset().y, max));
         out.inner

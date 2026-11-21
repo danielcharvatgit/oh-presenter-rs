@@ -682,6 +682,11 @@ pub fn import_file(path: &Path) -> Result<Bible, String> {
     if ext == "sqlite" || ext == "db" {
         return import_openlp_sqlite(path);
     }
+    if ext == "txt" {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        return Ok(import_txt(&String::from_utf8_lossy(&bytes), &stem));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
     let doc = roxmltree::Document::parse_with_options(&text, opts).map_err(|e| e.to_string())?;
@@ -924,6 +929,215 @@ pub fn import_openlp_sqlite(path: &Path) -> Result<Bible, String> {
         return Err("no verses in database (OpenLP web bibles are not stored locally)".into());
     }
     Ok(bible)
+}
+
+// ---------------------------------------------------------------------------
+// Plain text (best effort: any text file can be imported, verses are found where
+// the lines look like them)
+
+/// Canonical number of the book with this name or abbreviation (Czech or English).
+fn book_number_from_name(name: &str) -> Option<u32> {
+    let n = norm_book(name);
+    if n.is_empty() {
+        return None;
+    }
+    BOOKS.iter().position(|b| norm_book(b.osis) == n || b.en.iter().chain(b.cs.iter()).any(|x| norm_book(x) == n)).map(|i| i as u32 + 1)
+}
+
+/// `3:16` or `3,16` (also `3:16-17`, the first verse counts): chapter and verse.
+fn chapter_verse(token: &str) -> Option<(u32, u32)> {
+    let (c, v) = token.split_once([':', ','])?;
+    let v = v.split('-').next()?;
+    if c.is_empty() || v.is_empty() || !c.chars().all(|x| x.is_ascii_digit()) || !v.chars().all(|x| x.is_ascii_digit()) {
+        return None;
+    }
+    Some((c.parse().ok()?, v.parse().ok()?))
+}
+
+/// A plain number, optionally followed by `.` or `)`: `12`, `12.`, `12)`.
+fn plain_number(token: &str) -> Option<u32> {
+    let t = token.trim_end_matches(['.', ')']);
+    (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit())).then(|| t.parse().ok()).flatten()
+}
+
+/// Reads a bible from plain text, the format [`Bible::to_txt`] writes:
+///
+/// ```text
+/// # name: Bible 21
+/// Genesis 1:1 In the beginning God created the heavens and the earth.
+/// ```
+///
+/// Other texts are read as well as it goes: a line with only a book name starts that
+/// book, `Chapter 3` / `Kapitola 3` / `Genesis 3` a chapter, `1:1 text` or `1 text` is
+/// a verse, and any other line goes on with the last numbered verse (or, without one,
+/// becomes the next verse).
+pub fn import_txt(text: &str, stem: &str) -> Bible {
+    struct State {
+        books: Vec<Book>,
+        book: Option<usize>,
+        chapter: u32,
+        /// The last verse was given a number (a following plain line continues it).
+        numbered: bool,
+        stem: String,
+    }
+    impl State {
+        fn book(&mut self, name: &str) -> usize {
+            let name = name.trim();
+            if let Some(i) = self.books.iter().position(|b| b.name.eq_ignore_ascii_case(name)) {
+                return i;
+            }
+            let number = book_number_from_name(name)
+                .filter(|n| !self.books.iter().any(|b| b.number == *n))
+                .unwrap_or(1000 + self.books.len() as u32);
+            let name = if name.is_empty() { self.stem.clone() } else { name.to_string() };
+            self.books.push(Book { number, name, abbrev: String::new(), chapters: vec![] });
+            self.chapter = 1;
+            self.books.len() - 1
+        }
+        fn current_book(&mut self) -> usize {
+            match self.book {
+                Some(b) => b,
+                None => {
+                    let b = self.book("");
+                    self.book = Some(b);
+                    b
+                }
+            }
+        }
+        fn chapter(&mut self) -> &mut Chapter {
+            let b = self.current_book();
+            let n = self.chapter;
+            let chapters = &mut self.books[b].chapters;
+            let i = match chapters.iter().position(|c| c.number == n) {
+                Some(i) => i,
+                None => {
+                    chapters.push(Chapter { number: n, verses: vec![] });
+                    chapters.len() - 1
+                }
+            };
+            &mut chapters[i]
+        }
+        fn verse(&mut self, number: Option<u32>, text: &str) {
+            let text = clean(text);
+            if text.is_empty() {
+                return;
+            }
+            let numbered = number.is_some();
+            let ch = self.chapter();
+            let number = number.unwrap_or_else(|| ch.verses.iter().map(|v| v.number).max().unwrap_or(0) + 1);
+            ch.verses.push(Verse { number, text });
+            self.numbered = numbered;
+        }
+        fn go_on(&mut self, text: &str) {
+            let text = clean(text);
+            if self.numbered
+                && let Some(v) = self.chapter().verses.last_mut()
+            {
+                v.text.push(' ');
+                v.text.push_str(&text);
+                return;
+            }
+            self.verse(None, &text);
+        }
+    }
+    let mut meta = new_meta(stem, "", "");
+    let mut st = State { books: Vec::new(), book: None, chapter: 1, numbered: false, stem: stem.to_string() };
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(comment) = line.strip_prefix('#') {
+            if let Some((key, value)) = comment.split_once(':') {
+                let value = value.trim().to_string();
+                match key.trim().to_lowercase().as_str() {
+                    "name" if !value.is_empty() => meta.name = value,
+                    "abbrev" if !value.is_empty() => meta.abbrev = value,
+                    "language" => meta.language = value,
+                    "copyright" => meta.copyright = value,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // "Genesis 1:1 text" / "1:1 text" (a book name has at most three words; this
+        // keeps "had 1,000 sheep" in a sentence from being read as a reference)
+        if let Some(i) = tokens.iter().take(4).position(|t| chapter_verse(t).is_some_and(|(c, v)| c > 0 && v > 0)) {
+            let (c, v) = chapter_verse(tokens[i]).unwrap();
+            if i > 0 {
+                let b = st.book(&tokens[..i].join(" "));
+                st.book = Some(b);
+            }
+            st.chapter = c;
+            st.verse(Some(v), &tokens[i + 1..].join(" "));
+            continue;
+        }
+        // a book name alone
+        if book_number_from_name(line).is_some() {
+            let b = st.book(line);
+            st.book = Some(b);
+            st.numbered = false;
+            continue;
+        }
+        // "Chapter 3", "Kapitola 3", "Genesis 3", "3"
+        if let Some(n) = tokens.last().and_then(|t| plain_number(t)) {
+            let head = tokens[..tokens.len() - 1].join(" ");
+            let word = fold(&head).trim_end_matches('.').to_string();
+            if matches!(word.as_str(), "" | "chapter" | "kapitola" | "kap" | "ch") {
+                st.chapter = n;
+                st.numbered = false;
+                continue;
+            }
+            if book_number_from_name(&head).is_some() {
+                let b = st.book(&head);
+                st.book = Some(b);
+                st.chapter = n;
+                st.numbered = false;
+                continue;
+            }
+        }
+        // "1 text": a verse number in the current chapter
+        if tokens.len() > 1
+            && let Some(v) = plain_number(tokens[0])
+        {
+            st.verse(Some(v), &tokens[1..].join(" "));
+            continue;
+        }
+        st.go_on(line);
+    }
+    if meta.abbrev.trim().is_empty() {
+        meta.abbrev = new_meta(&meta.name, "", "").abbrev;
+    }
+    Bible::new(meta, st.books)
+}
+
+impl Bible {
+    /// The bible as plain text, one verse per line (`Genesis 1:1 text`), read back by
+    /// [`import_txt`].
+    pub fn to_txt(&self) -> String {
+        let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut out = format!("# name: {}\n# abbrev: {}\n", one_line(&self.meta.name), one_line(&self.meta.abbrev));
+        if !self.meta.language.is_empty() {
+            out.push_str(&format!("# language: {}\n", self.meta.language));
+        }
+        if !self.meta.copyright.trim().is_empty() {
+            out.push_str(&format!("# copyright: {}\n", one_line(&self.meta.copyright)));
+        }
+        for b in &self.books {
+            let name = match one_line(&b.name) {
+                n if !n.is_empty() => n,
+                _ => book_display_name(b.number, &self.meta.language).map(String::from).unwrap_or_else(|| format!("{}", b.number)),
+            };
+            out.push('\n');
+            for c in &b.chapters {
+                for v in &c.verses {
+                    out.push_str(&format!("{name} {}:{} {}\n", c.number, v.number, one_line(&v.text)));
+                }
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

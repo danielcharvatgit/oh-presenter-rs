@@ -1,31 +1,70 @@
 # notes and scratch files of the development
 /plan.txt
+/plan.md
+/notes.md
+/TODO.local.md
 *.log
 *.tmp
+*.temp
 *.bak
 *.orig
 *.rej
 *~
 *.swp
 *.swo
+\#*\#
+.\#*
 
 # editors and tools
 .idea/
 .vscode/
 .fleet/
 .zed/
+.history/
 .claude/
 *.iml
+*.sublime-project
+*.sublime-workspace
 .direnv/
 .envrc
 
+# local secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+
 # operating systems
 .DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.Trash-*/
+.directory
 Thumbs.db
+ehthumbs.db
 desktop.ini
+$RECYCLE.BIN/
 
 # Rust build output (also target/debian/*.deb and target/installer/*.exe)
 /target/
+**/*.rs.bk
+*.pdb
+
+# local cargo state (a CARGO_HOME inside the project, registry/git caches,
+# credentials); only the project's cargo config is meant to be committed
+/.cargo/*
+!/.cargo/config.toml
+
+# profiling and coverage output
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+flamegraph.svg
+/coverage/
+lcov.info
+tarpaulin-report.html
 
 # built packages and installers, wherever they end up
 # (they are published as GitHub release files, not committed)
@@ -35,6 +74,7 @@ desktop.ini
 *.exe
 *.msi
 *.msix
+*.dmg
 *.AppImage
 *.flatpak
 *.flatpakref
@@ -42,11 +82,17 @@ desktop.ini
 *.zip
 *.tar.gz
 *.tar.xz
+*.tar.zst
+/dist/
 
 # flatpak build output
 /flatpak-build/
 /flatpak-repo/
 /.flatpak-builder/
+/build-dir/
 
 # ffmpeg.exe / ffplay.exe downloaded by packaging/windows/get-ffmpeg.ps1
 /packaging/windows/ffmpeg/
+
+# make-no-mistakes run state
+/.mnm/

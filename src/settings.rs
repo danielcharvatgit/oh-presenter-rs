@@ -58,10 +58,16 @@ pub struct Settings {
     pub bible_index_languages: Vec<String>,
     /// Keep the output (projector) window above all other windows.
     pub output_always_on_top: bool,
+    /// At the start, open the output window full screen on a second screen (when there is one).
+    pub output_on_second_screen: bool,
+    /// The screen the output was last shown on (it opens there again when it is not the program's).
+    pub output_screen: Option<crate::screens::ScreenId>,
     /// Look of alerts (messages running across the output).
     pub alert_style: crate::model::AlertStyle,
     /// Text the alert window (F7) starts with.
     pub alert_default_message: String,
+    /// The clock on the output (encoded dots and / or plain digits).
+    pub clock: crate::model::ClockStyle,
 }
 
 impl Default for Settings {
@@ -84,8 +90,11 @@ impl Default for Settings {
             legacy_import_answered: false,
             bible_index_languages: Vec::new(),
             output_always_on_top: false,
+            output_on_second_screen: true,
+            output_screen: None,
             alert_style: crate::model::AlertStyle::default(),
             alert_default_message: String::new(),
+            clock: crate::model::ClockStyle::default(),
         }
     }
 }

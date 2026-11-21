@@ -1,4 +1,4 @@
-use super::{App, Dialog, Then, WriteKind};
+use super::{App, Dialog, FollowFocus, Then, WriteKind};
 use crate::i18n::{t, tf};
 use crate::model::*;
 use crate::render;
@@ -36,7 +36,7 @@ impl App {
         let q = fold(&self.songs.search);
         let mut open = None;
         let mut add = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| {
             let mut shown = 0;
             for s in &self.lib.songs {
                 if !q.is_empty() && !fold(&s.title).contains(&q) && !s.text_matches(&q) {
@@ -255,7 +255,7 @@ impl App {
         let slides = self.item_slides(&item);
         let w = ui.available_width();
         let size = Vec2::new(w, w * CANVAS_H / CANVAS_W);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| {
             for (i, s) in slides.iter().enumerate() {
                 ui.label(format!("{}  {}", i + 1, self.slide_label(s)));
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());

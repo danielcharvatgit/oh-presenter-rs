@@ -1,4 +1,4 @@
-use super::{App, ItemRef, LIVE_COLOR, Then};
+use super::{App, FollowFocus, ItemRef, LIVE_COLOR, Tab, Then};
 use crate::i18n::{t, tf};
 use crate::model::*;
 use crate::render;
@@ -7,6 +7,45 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke, StrokeKind, Vec2};
 
 /// Height of a row in the service item list (room for a small slide preview).
 const ITEM_ROW_H: f32 = 44.0;
+
+/// The three columns of the Service tab (items, slides, live) as last drawn, for moving
+/// between them and resizing them with the keyboard ([`App::service_column_keys`]).
+pub struct Columns {
+    /// Panel ids of the left (items) and right (live) column (their saved sizes).
+    panels: Option<(egui::Id, egui::Id)>,
+    rects: [egui::Rect; 3],
+    /// The first control of each column (gets the focus when moving to the column).
+    first: [Option<egui::Id>; 3],
+}
+
+impl Columns {
+    #[cfg(test)]
+    pub fn panels(&self) -> Option<(egui::Id, egui::Id)> {
+        self.panels
+    }
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self { panels: None, rects: [egui::Rect::NOTHING; 3], first: [None; 3] }
+    }
+}
+
+/// Id of a panel's resize handle (the border), as egui makes it.
+fn border_id(panel: egui::Id) -> egui::Id {
+    panel.with("__resize")
+}
+
+/// The part of the Service tab that was clicked last (where the video keys apply).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceArea {
+    /// The service items (left).
+    List,
+    /// The slides of the selected item (middle).
+    Slides,
+    /// The live picture and its controls (right).
+    Live,
+}
 
 impl App {
     pub fn slide_label(&self, s: &Slide) -> String {
@@ -26,16 +65,115 @@ impl App {
     }
 
     pub fn service_tab(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("service_items").resizable(true).default_size(270.0).show(ui, |ui| self.service_list(ui));
-        egui::Panel::right("service_live").resizable(true).default_size(380.0).show(ui, |ui| self.live_panel(ui));
-        egui::CentralPanel::default_margins().show(ui, |ui| self.slides_panel(ui));
+        // the ids egui gives these panels (it keeps their sizes under them)
+        let left_id = ui.scope_id().with_salt(egui::IdSalt::new("service_items"));
+        let right_id = ui.scope_id().with_salt(egui::IdSalt::new("service_live"));
+        self.service_cols.first = [None; 3];
+        let l = egui::Panel::left("service_items").resizable(true).default_size(270.0).show(ui, |ui| self.service_list(ui));
+        let r = egui::Panel::right("service_live").resizable(true).default_size(380.0).show(ui, |ui| self.live_panel(ui));
+        let c = egui::CentralPanel::default_margins().show(ui, |ui| self.slides_panel(ui));
+        self.service_cols.panels = Some((left_id, right_id));
+        self.service_cols.rects = [l.response.rect, c.response.rect, r.response.rect];
+        // a focused border keeps ← → (egui would move the focus with them)
+        for id in [border_id(left_id), border_id(right_id)] {
+            if ui.memory(|m| m.has_focus(id)) {
+                ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { horizontal_arrows: true, ..Default::default() }));
+            }
+        }
+        // where a mouse button went down this frame (also when it went up again in the same frame)
+        let press = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::PointerButton { pos, pressed: true, .. } => Some(*pos),
+                _ => None,
+            })
+        });
+        if let Some(p) = press {
+            let area = [(l.response.rect, ServiceArea::List), (r.response.rect, ServiceArea::Live), (c.response.rect, ServiceArea::Slides)]
+                .into_iter()
+                .find(|(r, _)| r.contains(p))
+                .map(|(_, a)| a);
+            if area.is_some() {
+                self.service_area = area;
+            }
+        }
+    }
+
+    /// Service tab keys (before the shortcuts, which step slides with ← →):
+    /// * with the keyboard focus on a border between columns (reached with Tab):
+    ///   ← → move it (Shift+← → in bigger steps);
+    /// * Ctrl+Shift+← → go to the previous / next column.
+    pub fn service_column_keys(&mut self, ctx: &egui::Context) {
+        if self.tab != Tab::Service || self.dialog.is_some() || self.file_dialog.is_some() || self.capture.is_some() {
+            return;
+        }
+        let Some((left_id, right_id)) = self.service_cols.panels else { return };
+        let focused = ctx.memory(|m| m.focused());
+        let border = focused.and_then(|f| {
+            if f == border_id(left_id) {
+                Some(left_id)
+            } else if f == border_id(right_id) {
+                Some(right_id)
+            } else {
+                None
+            }
+        });
+        if let Some(panel) = border {
+            let moved = ctx.input_mut(|i| {
+                let (s, n) = (egui::Modifiers::SHIFT, egui::Modifiers::NONE);
+                let (l, r) = (egui::Key::ArrowLeft, egui::Key::ArrowRight);
+                [(s, l, -50.0), (s, r, 50.0), (n, l, -10.0), (n, r, 10.0)]
+                    .into_iter()
+                    .map(|(m, k, d)| if i.consume_key(m, k) { d } else { 0.0 })
+                    .sum::<f32>()
+            });
+            if moved != 0.0
+                && let Some(mut state) = egui::containers::panel::PanelState::load(ctx, panel)
+            {
+                let r = &mut state.outer_rect;
+                // the border moves: the left column gets wider to the right, the right one narrower
+                if panel == left_id {
+                    r.max.x = (r.max.x + moved).max(r.min.x + 96.0);
+                } else {
+                    r.min.x = (r.min.x + moved).min(r.max.x - 96.0);
+                }
+                ctx.data_mut(|d| d.insert_persisted(panel, state));
+                ctx.request_repaint();
+            }
+            return;
+        }
+        if ctx.text_edit_focused() {
+            return; // Ctrl+Shift+← → select words in a text field
+        }
+        let cs = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let (prev, next) = ctx.input_mut(|i| (i.consume_key(cs, egui::Key::ArrowLeft), i.consume_key(cs, egui::Key::ArrowRight)));
+        if !prev && !next {
+            return;
+        }
+        let cols = &self.service_cols;
+        let current = focused.and_then(|f| ctx.read_response(f)).and_then(|r| cols.rects.iter().position(|c| c.contains(r.rect.center())));
+        let target = match (current, next) {
+            (None, true) => 0,
+            (None, false) => 2,
+            (Some(c), true) => (c + 1).min(2),
+            (Some(c), false) => c.saturating_sub(1),
+        };
+        // the column may have nothing to focus (no item selected): the next one that has
+        let order: Vec<usize> = if next { (target..3).collect() } else { (0..=target).rev().collect() };
+        if let Some((c, id)) = order.into_iter().find_map(|c| cols.first[c].map(|id| (c, id))) {
+            ctx.memory_mut(|m| m.request_focus(id));
+            self.alt_nav.keyboard_focus = true;
+            // the video keys follow, as after a click in that column
+            self.service_area = Some([ServiceArea::List, ServiceArea::Slides, ServiceArea::Live][c]);
+        }
     }
 
     fn service_list(&mut self, ui: &mut egui::Ui) {
         let sc = self.settings.shortcuts.clone();
         ui.heading(t("service.title"));
         ui.horizontal_wrapped(|ui| {
-            if ui.button(t("service.new")).on_hover_text(sc.describe(Action::NewService)).clicked() {
+            let r = ui.button(t("service.new")).on_hover_text(sc.describe(Action::NewService));
+            self.service_cols.first[0] = Some(r.id);
+            if r.clicked() {
                 self.request(Then::NewService);
             }
             if ui.button(t("service.open")).on_hover_text(sc.describe(Action::OpenService)).clicked() {
@@ -78,7 +216,7 @@ impl App {
                 self.slides_of(ItemRef::Service(i)).into_iter().nth(slide).map(|s| s.scene)
             })
             .collect();
-        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 40.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height() - 40.0).show_following_focus(ui, |ui| {
             if self.service.items.is_empty() {
                 ui.weak(t("service.empty"));
             }
@@ -237,7 +375,7 @@ impl App {
                 r.request_focus();
                 let q = crate::storage::fold(&self.add_search);
                 let mut add = None;
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show_following_focus(ui, |ui| {
                     for s in &self.lib.songs {
                         if !q.is_empty() && !crate::storage::fold(&s.title).contains(&q) {
                             continue;
@@ -258,7 +396,7 @@ impl App {
             ui.menu_button((super::plus_icon(), t("service.add_design")), |ui| {
                 ui.set_min_width(240.0);
                 let mut add = None;
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show_following_focus(ui, |ui| {
                     for d in &self.lib.designs {
                         if ui.button(&d.name).clicked() {
                             add = Some(d.clone());
@@ -362,11 +500,15 @@ impl App {
         };
         let mut clicked = None;
         let mut double = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(10.0);
                 for (i, s) in slides.iter().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(thumb + Vec2::new(0.0, 22.0), Sense::click());
+                    if i == 0 || (i == self.sel_slide && self.sel_item == Some(item_ref)) {
+                        // moving to this column focuses the selected slide
+                        self.service_cols.first[1] = Some(resp.id);
+                    }
                     let painter = ui.painter_at(rect.expand(3.0));
                     let thumb_rect = egui::Rect::from_min_size(rect.min + Vec2::new(0.0, 22.0), thumb);
                     render::draw_scene(&painter, thumb_rect, &s.scene, &mut self.textures);
@@ -442,12 +584,37 @@ impl App {
                 ui.weak(format!("{} — {}", it.title(), slide + 1));
             }
         });
-        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        if self.frozen.is_some() {
+            ui.colored_label(LIVE_COLOR, format!("❄ {}", t("output.frozen_hint")));
+        }
+        let rect = if matches!(self.live, Scene::Video(_)) {
+            // a live video can be controlled with the keyboard once its preview has the focus
+            let id = Self::video_preview_id();
+            let rect = ui.allocate_space(size).1;
+            let r = ui.interact(rect, id, Sense::click()).on_hover_text(t("video.keys_hint"));
+            // moving to the live column focuses the video (its keys work right away)
+            self.service_cols.first[2] = Some(id);
+            if r.clicked() {
+                r.request_focus();
+            }
+            if r.has_focus() {
+                // ← → stay here (egui would move the focus with them)
+                ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter { horizontal_arrows: true, ..Default::default() }));
+                ui.painter().rect_stroke(rect.expand(2.0), 2.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), StrokeKind::Outside);
+            }
+            rect
+        } else {
+            ui.allocate_exact_size(size, Sense::hover()).0
+        };
         let scene = if self.blank { Scene::Blank } else { self.live.clone() };
         render::draw_scene_live(ui.painter(), rect, &scene, &mut self.textures);
         self.video_controls(ui);
         ui.horizontal_wrapped(|ui| {
-            if ui.button(format!("▶ {}", t("service.go_live"))).on_hover_text(sc.describe(Action::GoLive)).clicked() {
+            let r = ui.button(format!("▶ {}", t("service.go_live"))).on_hover_text(sc.describe(Action::GoLive));
+            if self.service_cols.first[2].is_none() {
+                self.service_cols.first[2] = Some(r.id);
+            }
+            if r.clicked() {
                 self.go_live();
             }
             let mut live = self.settings.live_follows_selection;
@@ -456,8 +623,7 @@ impl App {
                 .on_hover_text(format!("{}\n{}", t("service.live_mode_hint"), sc.describe(Action::ToggleLive)))
                 .changed()
             {
-                self.settings.live_follows_selection = live;
-                self.save_settings();
+                self.set_live_mode(live);
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -471,11 +637,18 @@ impl App {
                 self.toggle_blank();
             }
             if ui
+                .selectable_label(self.frozen.is_some(), format!("❄ {}", t("output.freeze")))
+                .on_hover_text(format!("{}\n{}", t("output.freeze_hint"), sc.describe(Action::Freeze)))
+                .clicked()
+            {
+                self.toggle_freeze();
+            }
+            if ui
                 .selectable_label(self.output_open, format!("🖵 {}", t("output.window")))
                 .on_hover_text(sc.describe(Action::ToggleOutput))
                 .clicked()
             {
-                self.output_open = !self.output_open;
+                self.handle_actions(vec![Action::ToggleOutput], &ui.ctx().clone());
             }
             if ui.button(format!("⛶ {}", t("output.fullscreen"))).on_hover_text(sc.describe(Action::OutputFullscreen)).clicked() {
                 self.handle_actions(vec![Action::OutputFullscreen], &ui.ctx().clone());

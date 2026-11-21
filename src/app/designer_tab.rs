@@ -1,4 +1,4 @@
-use super::{App, Dialog, Then, WriteKind};
+use super::{App, Dialog, FollowFocus, Then, WriteKind};
 use crate::formats;
 use crate::i18n::t;
 use crate::model::*;
@@ -31,7 +31,7 @@ impl App {
     pub fn designer_tab(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("designer_library").resizable(true).default_size(230.0).show(ui, |ui| self.designer_library(ui));
         egui::Panel::right("designer_props").resizable(true).default_size(280.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.designer_properties(ui));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| self.designer_properties(ui));
         });
         egui::CentralPanel::default_margins().show(ui, |ui| self.designer_canvas(ui));
     }
@@ -106,7 +106,7 @@ impl App {
         }
         let q = crate::storage::fold(&self.designer.search);
         let mut open = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_following_focus(ui, |ui| {
             for d in &self.lib.designs {
                 if !q.is_empty() && !crate::storage::fold(&d.name).contains(&q) {
                     continue;
@@ -148,7 +148,7 @@ impl App {
     pub(super) fn designer_add(&mut self, kind: ObjectKind) {
         let (w, h) = match &kind {
             ObjectKind::Text { .. } => (600.0, 100.0),
-            ObjectKind::Image { media } => {
+            ObjectKind::Image { media, .. } => {
                 let size =
                     image::image_dimensions(crate::storage::media_path(media)).map(|(w, h)| (w as f32, h as f32)).unwrap_or((400.0, 300.0));
                 let s = (CANVAS_W * 0.8 / size.0).min(CANVAS_H * 0.8 / size.1).min(1.0);
@@ -431,9 +431,19 @@ impl App {
                         ui.add(egui::DragValue::new(stroke_width).range(0.0..=100.0));
                         ui.end_row();
                     }
-                    ObjectKind::Image { media } => {
+                    ObjectKind::Image { media, opacity } => {
                         ui.label(t("designer.image"));
                         ui.weak(media.as_str());
+                        ui.end_row();
+                        ui.label(t("designer.opacity"));
+                        let mut percent = (*opacity * 100.0).round();
+                        if ui
+                            .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix(" %"))
+                            .on_hover_text(t("designer.opacity_hint"))
+                            .changed()
+                        {
+                            *opacity = percent / 100.0;
+                        }
                         ui.end_row();
                         ui.label("");
                         if ui.button(t("designer.replace_image")).clicked() {

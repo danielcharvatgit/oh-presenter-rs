@@ -24,6 +24,12 @@ fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Rgba) -> bool {
     changed
 }
 
+/// A coloured dot like on the encoded clock (drawn, so it does not depend on the font).
+fn color_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    ui.painter().circle(rect.center(), 7.0, color, egui::Stroke::new(1.0, egui::Color32::from_gray(140)));
+}
+
 fn settings_about(ui: &mut egui::Ui) {
     ui.heading(t("settings.about"));
     ui.label(RichText::new("oh! Presenter").size(22.0).strong());
@@ -45,6 +51,8 @@ impl App {
             changed |= app.settings_general(ui);
             ui.separator();
             changed |= app.settings_display(ui);
+            ui.separator();
+            changed |= app.settings_clock(ui);
             ui.separator();
             changed |= app.settings_alerts(ui);
             ui.separator();
@@ -153,6 +161,7 @@ impl App {
     fn settings_display(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         ui.heading(t("settings.display"));
+        let second_screen_hint = format!("{}\n\n{}", t("settings.second_screen_hint"), self.screens_text());
         let style = &mut self.settings.text_style;
         egui::Grid::new("display").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             changed |= color_row(ui, &t("settings.text_color"), &mut style.color);
@@ -199,6 +208,12 @@ impl App {
                 .on_hover_text(t("settings.always_on_top_hint"))
                 .changed();
             ui.end_row();
+            ui.label("");
+            changed |= ui
+                .checkbox(&mut self.settings.output_on_second_screen, t("settings.second_screen"))
+                .on_hover_text(&second_screen_hint)
+                .changed();
+            ui.end_row();
         });
         if changed {
             // the live text slide picks up the new style right away
@@ -210,6 +225,89 @@ impl App {
                 self.broadcast();
             }
         }
+        changed
+    }
+
+    /// Settings → Clock on the output.
+    fn settings_clock(&mut self, ui: &mut egui::Ui) -> bool {
+        use crate::model::{ClockPosition, ClockSize};
+        let mut changed = false;
+        ui.heading(t("settings.clock"));
+        let c = &mut self.settings.clock;
+        changed |= ui.checkbox(&mut c.show, t("settings.clock_show")).on_hover_text(t("settings.clock_show_hint")).changed();
+        ui.indent("clock_plain", |ui| {
+            changed |= ui.add_enabled(c.show, egui::Checkbox::new(&mut c.plain, t("settings.clock_plain"))).changed();
+        });
+        ui.add_enabled_ui(c.show, |ui| {
+            egui::Grid::new("clock").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(t("settings.clock_opacity"));
+                ui.horizontal(|ui| {
+                    for o in [100u8, 80, 50] {
+                        changed |= ui.radio_value(&mut c.opacity, o, format!("{o} %")).changed();
+                    }
+                });
+                ui.end_row();
+                ui.label(t("settings.clock_position"));
+                ui.horizontal_wrapped(|ui| {
+                    for (p, key) in [
+                        (ClockPosition::Left, "settings.clock_left"),
+                        (ClockPosition::BottomMiddle, "settings.clock_bottom"),
+                        (ClockPosition::TopMiddle, "settings.clock_top"),
+                        (ClockPosition::Right, "settings.clock_right"),
+                    ] {
+                        changed |= ui.radio_value(&mut c.position, p, t(key)).changed();
+                    }
+                });
+                ui.end_row();
+                ui.label(t("settings.clock_size"));
+                ui.horizontal(|ui| {
+                    for (s, key) in [
+                        (ClockSize::Tiny, "settings.clock_small"),
+                        (ClockSize::Small, "settings.clock_medium"),
+                        (ClockSize::Medium, "settings.clock_large"),
+                    ] {
+                        changed |= ui.radio_value(&mut c.size, s, t(key)).changed();
+                    }
+                });
+                ui.end_row();
+            });
+        });
+        let secs = crate::clock::now_secs();
+        if c.show {
+            // the clock alone (as big as on a slide this wide), at its left / middle / right
+            let w = ui.available_width().min(480.0);
+            let plate = crate::clock::plate_size(ui.painter(), w, c, secs);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, plate.y * 1.8 + 4.0), egui::Sense::hover());
+            crate::clock::draw(&ui.painter_at(rect), rect, w, c, secs);
+            ui.ctx().request_repaint_after(crate::clock::repaint_in(c, secs));
+        }
+        let dots = crate::clock::encode(secs);
+        let names: Vec<String> = dots.iter().map(|d| t(crate::clock::COLOR_KEYS[*d])).collect();
+        let from = crate::clock::decode(dots);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(t("settings.clock_now"));
+            for d in dots {
+                color_dot(ui, crate::clock::COLORS[d]);
+            }
+            ui.label(tf(
+                "settings.clock_now_value",
+                &[
+                    ("colors", &names.join(", ")),
+                    ("from", &crate::clock::face_time(from)),
+                    ("to", &crate::clock::face_time(from + 11 * 60)),
+                    ("time", &crate::clock::plain_time(secs)),
+                ],
+            ));
+        });
+        egui::CollapsingHeader::new(t("settings.clock_howto")).id_salt("clock_howto").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, (color, key)) in crate::clock::COLORS.iter().zip(crate::clock::COLOR_KEYS).enumerate() {
+                    color_dot(ui, *color);
+                    ui.label(format!("{} = {i}   ", t(key)));
+                }
+            });
+            ui.label(t("settings.clock_howto_text"));
+        });
         changed
     }
 

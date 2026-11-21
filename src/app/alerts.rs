@@ -172,26 +172,19 @@ impl App {
             });
             ui.end_row();
         });
-        // live preview over a sample slide
-        let w = ui.available_width().min(480.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, w * CANVAS_H / CANVAS_W), Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, self.settings.text_style.background.to_color32());
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            t("settings.alert_preview_slide"),
-            egui::FontId::proportional(18.0 * w / 480.0),
-            self.settings.text_style.color.to_color32().gamma_multiply(0.5),
-        );
+        // live preview: just the running strip (as big as on a slide this wide)
         let sample = if self.settings.alert_default_message.trim().is_empty() {
             t("settings.alert_preview_text")
         } else {
             self.settings.alert_default_message.clone()
         };
-        let preview = Alert { text: sample, style: self.settings.alert_style.clone(), duration: 0.0 };
+        let mut preview = Alert { text: sample, style: self.settings.alert_style.clone(), duration: 0.0 };
+        let w = ui.available_width().min(480.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(w, render::alert_strip_height(ui.painter(), w, &preview)), Sense::hover());
+        // the strip fills the preview whatever its position on the output
+        preview.style.valign = VAlign::Top;
         let secs = ui.input(|i| i.time) as f32;
-        render::draw_alert(&painter, rect, &preview, secs);
+        render::draw_alert(&ui.painter_at(rect), rect, &preview, secs);
         if ui.is_rect_visible(rect) {
             // animate only while the preview is on screen
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));

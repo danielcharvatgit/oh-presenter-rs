@@ -123,7 +123,18 @@ pub enum ObjectKind {
     /// `media` is a file name inside the media store.
     Image {
         media: String,
+        /// 0.0 (invisible) – 1.0 (as the picture is; its own transparency always counts).
+        #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
+        opacity: f32,
     },
+}
+
+fn full_opacity() -> f32 {
+    1.0
+}
+
+fn is_full_opacity(o: &f32) -> bool {
+    *o >= 1.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,7 +168,7 @@ impl Default for CanvasDoc {
 impl CanvasDoc {
     pub fn media(&self) -> impl Iterator<Item = &str> {
         self.objects.iter().filter_map(|o| match &o.kind {
-            ObjectKind::Image { media } => Some(media.as_str()),
+            ObjectKind::Image { media, .. } => Some(media.as_str()),
             _ => None,
         })
     }
@@ -505,11 +516,7 @@ impl VideoScene {
     /// The position `elapsed` seconds after this state was sent.
     pub fn position_after(&self, elapsed: f64) -> f64 {
         let pos = if self.paused { self.position } else { self.position + elapsed };
-        if self.duration > 0.0 {
-            if self.looped { pos % self.duration } else { pos.min(self.duration) }
-        } else {
-            pos
-        }
+        if self.duration > 0.0 { if self.looped { pos % self.duration } else { pos.min(self.duration) } } else { pos }
     }
 
     /// Playing and past the end (not looped).
@@ -638,4 +645,48 @@ pub struct Alert {
     pub style: AlertStyle,
     /// How long it runs, in seconds from when an output receives it; 0 = until stopped.
     pub duration: f32,
+}
+
+/// Where the clock sits on the output: always at an edge of the screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClockPosition {
+    /// Bottom left corner.
+    Left,
+    #[default]
+    BottomMiddle,
+    TopMiddle,
+    /// Bottom right corner.
+    Right,
+}
+
+/// Size of the clock's dots. The names are kept from the saved settings; shown as
+/// small (`Tiny`), medium (`Small`) and large (`Medium`). The old `Large` became `Medium`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClockSize {
+    /// The smallest dots: a third of `Small`, without an outline.
+    Tiny,
+    Small,
+    #[default]
+    #[serde(alias = "Large")]
+    Medium,
+}
+
+/// The clock on the output (Settings → Clock on the output). See [`crate::clock`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClockStyle {
+    /// Show the encoded clock (three coloured dots).
+    pub show: bool,
+    /// Also show the time as plain digits (only together with `show`).
+    pub plain: bool,
+    /// Opacity in percent: 100, 80 or 50.
+    pub opacity: u8,
+    pub position: ClockPosition,
+    pub size: ClockSize,
+}
+
+impl Default for ClockStyle {
+    fn default() -> Self {
+        Self { show: false, plain: false, opacity: 100, position: ClockPosition::default(), size: ClockSize::default() }
+    }
 }

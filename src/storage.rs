@@ -191,18 +191,35 @@ pub struct Library {
     pub designs: Vec<Design>,
 }
 
-fn load_dir<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<T> {
+/// The library's `.json` files in `dir`.
+fn json_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect()
+}
+
+/// Bytes of the files a [`Library::load_with_progress`] reads (for its progress bar).
+pub fn files_size(files: &[PathBuf]) -> u64 {
+    files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum()
+}
+
+/// Reads `files`, calling `progress` with the bytes of every file read.
+fn load_files<T: serde::de::DeserializeOwned>(files: &[PathBuf], progress: &mut dyn FnMut(u64)) -> Vec<T> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                match std::fs::read(&p).map(|b| serde_json::from_slice::<T>(&b)) {
-                    Ok(Ok(v)) => out.push(v),
-                    Ok(Err(err)) => eprintln!("skipping {}: {err}", p.display()),
+    for p in files {
+        match std::fs::read(p) {
+            Ok(b) => {
+                match serde_json::from_slice::<T>(&b) {
+                    Ok(v) => out.push(v),
                     Err(err) => eprintln!("skipping {}: {err}", p.display()),
                 }
+                progress(b.len() as u64);
             }
+            Err(err) => eprintln!("skipping {}: {err}", p.display()),
         }
     }
     out
@@ -213,10 +230,23 @@ fn id_file(dir: PathBuf, id: &str) -> PathBuf {
 }
 
 impl Library {
+    #[cfg(test)]
     pub fn load() -> Self {
-        let mut songs: Vec<Song> = load_dir(&paths().songs());
+        Self::load_with_progress(&mut |_| {})
+    }
+
+    /// The song and design files (what [`Self::load_with_progress`] reads).
+    pub fn files() -> Vec<PathBuf> {
+        let mut files = json_files(&paths().songs());
+        files.extend(json_files(&paths().designs()));
+        files
+    }
+
+    /// Loads the library, calling `progress` with the bytes of every file read.
+    pub fn load_with_progress(progress: &mut dyn FnMut(u64)) -> Self {
+        let mut songs: Vec<Song> = load_files(&json_files(&paths().songs()), progress);
         songs.sort_by_key(|s| s.title.to_lowercase());
-        let mut designs: Vec<Design> = load_dir(&paths().designs());
+        let mut designs: Vec<Design> = load_files(&json_files(&paths().designs()), progress);
         designs.sort_by_key(|d| d.name.to_lowercase());
         Self { songs, designs }
     }
