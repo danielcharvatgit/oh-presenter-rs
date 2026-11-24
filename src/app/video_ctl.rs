@@ -44,6 +44,26 @@ impl App {
         }
     }
 
+    /// The video Space (play / pause) works on, wherever was clicked last: as
+    /// [`App::video_key_target`]; else the selected video item (live or not); else the live
+    /// video, whatever is selected (Space is no slide key, so it is always the video's).
+    pub fn play_pause_target(&self) -> Option<VideoTarget> {
+        if self.tab != Tab::Service {
+            return None;
+        }
+        if let Some(t) = self.video_key_target() {
+            return Some(t);
+        }
+        let live_video = matches!(self.live, Scene::Video(_));
+        if let Some(sel) = self.sel_item
+            && matches!(self.item(sel).map(|i| &i.kind), Some(ItemKind::Video(_)))
+        {
+            let is_live = live_video && matches!(self.live_pos, Some((r, _)) if r == sel);
+            return Some(if is_live { VideoTarget::Live } else { VideoTarget::Selected });
+        }
+        live_video.then_some(VideoTarget::Live)
+    }
+
     /// Space on a video: the live video plays / pauses (from the start once it ended; a
     /// blanked screen is shown again); a selected video that is not live goes live.
     pub fn video_play_pause(&mut self, target: VideoTarget) {
@@ -218,15 +238,24 @@ impl App {
         egui::Id::unique("live_video_preview")
     }
 
-    /// Space / ← → for the live video while its preview has the keyboard focus. Runs
-    /// before the shortcuts, which would step the slides with these keys.
+    /// Space / ← → for the live video while its preview has the keyboard focus, and the
+    /// play / pause keys while a row of the service item list has it (egui would press the
+    /// row with Space). Runs before the shortcuts, which would step the slides with ← →.
     pub(super) fn video_keys(&mut self, ctx: &egui::Context) {
-        if self.tab != Tab::Service
-            || !matches!(self.live, Scene::Video(_))
-            || self.dialog.is_some()
-            || self.file_dialog.is_some()
-            || !ctx.memory(|m| m.has_focus(Self::video_preview_id()))
+        if self.tab != Tab::Service || self.dialog.is_some() || self.file_dialog.is_some() || self.capture.is_some() {
+            return;
+        }
+        let focused = ctx.memory(|m| m.focused());
+        if focused.is_some_and(|f| self.service_row_ids.contains(&f))
+            && let Some(target) = self.play_pause_target()
         {
+            let keys = self.settings.shortcuts.bindings(crate::shortcuts::Action::VideoPlayPause);
+            let hit = ctx.input_mut(|i| keys.iter().any(|b| b.consume(i)));
+            if hit {
+                self.video_play_pause(target);
+            }
+        }
+        if !matches!(self.live, Scene::Video(_)) || focused != Some(Self::video_preview_id()) {
             return;
         }
         let none = egui::Modifiers::NONE;

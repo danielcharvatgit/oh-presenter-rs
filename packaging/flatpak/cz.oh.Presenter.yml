@@ -22,6 +22,9 @@ finish-args:
   # services, songs, bibles and pictures anywhere in the home folder; the first start
   # also looks there for files of the old oh-presenter
   - --filesystem=home
+  # "keep the desktop off the projector": turns the Super key of GNOME / Cinnamon / Plasma off
+  # while presenting (gsettings / kwriteconfig6 of the desktop, run with flatpak-spawn --host)
+  - --talk-name=org.freedesktop.Flatpak
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:

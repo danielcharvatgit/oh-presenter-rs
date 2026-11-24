@@ -505,8 +505,27 @@ video.length = Délka {time}
 video.play = Přehrát
 video.pause = Pozastavit
 video.restart = Na začátek
-video.keys_hint = Klikněte na náhled videa (nebo na něj přejděte klávesou Tab), pak: mezerník = přehrát / pozastavit, ← → = o 5 sekund zpět / vpřed
+video.keys_hint = Mezerník = přehrát / pozastavit živé video (nebo vybrané video zobrazit živě) kdekoli na kartě Shromáždění; ← → = o 5 sekund zpět / vpřed po kliknutí na video, jeho náhled nebo živý panel
 
 # pictures
 image.unsupported = Tento formát obrázku není podporován
 image.needs_ffmpeg = Obrázky HEIC / HEIF a AVIF se převádějí programem ffmpeg, který nebyl nalezen (Ubuntu / Debian: sudo apt install ffmpeg)
+
+# 0.2.0: přejmenování, klávesy plochy, průhledný výstup, MCP
+service.rename = Přejmenovat
+service.rename_hint = Název zobrazený ve shromáždění. Prázdný = vlastní název položky ({title}).
+action.RenameItem = Přejmenovat vybranou položku shromáždění
+output.fullscreen_restored = Plocha vzala výstupu celou obrazovku (klávesa správce oken?): byla vrácena
+settings.advanced = Pokročilá nastavení
+settings.transparent = Průhledný výstup (obrázky s průhledností jsou překryv)
+settings.transparent_hint = Průhledná místa obrázku (PNG s alfa kanálem) ukazují, co je za výstupním oknem, např. upoutávku přehrávanou pod ním v jiném přehrávači. Zapněte i „držet nad všemi ostatními okny“. Potřebuje plochu s kompozicí (Windows, GNOME, Plasma, Cinnamon, Hyprland…). Projeví se při příštím spuštění.
+settings.guard_keys = Při promítání nepouštět plochu na projektor
+settings.guard_keys_hint = Dokud je výstup na celé obrazovce na jiné obrazovce: GNOME / Ubuntu, Cinnamon a KDE Plasma — klávesa Super (Windows) neotevře přehled ani nabídku; Windows — Win+Tab, Win+D, Win+M a Win+, jsou zablokované. Nastavení plochy se potom vrátí. Na každé ploše (i Hyprland, X11 a Wayland) se výstup vrátí na celou obrazovku, když ho z ní klávesa správce oken vezme.
+settings.mcp = MCP server
+settings.mcp_enabled = Povolit ovládání programu kódovými agenty (MCP)
+settings.mcp_hint = Kódoví agenti (Claude Code, jiní MCP klienti) na tomto počítači pak mohou dělat vše, co tlačítka programu, kromě návrháře snímků: shromáždění, snímky, videa, výstupní okno, upozornění, bible a nastavení. Připojit se mohou jen programy na tomto počítači.
+settings.mcp_error = MCP server se nepodařilo spustit: {err}
+settings.mcp_running = MCP server běží na {url}. Připojte kódového agenta, např.:
+settings.mcp_off = MCP server je vypnutý.
+settings.mcp_cli_hint = Bez okna programu: oh-presenter-rs --cli (viz oh-presenter-rs --help); --mcp tam spustí i tento server.
+settings.copy = Kopírovat

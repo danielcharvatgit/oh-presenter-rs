@@ -14,8 +14,9 @@
 //! You should have received a copy of the GNU General Public License along with this
 //! program (the LICENSE file). If not, see <https://www.gnu.org/licenses/>.
 //!
-//! Usage:
-//!   oh-presenter-rs                      the presenter
+//! Usage (`oh-presenter-rs --help` lists everything, see [`cli`]):
+//!   oh-presenter-rs [options]            the presenter
+//!   oh-presenter-rs --cli [options]      only the output window, controlled from the command line
 //!   oh-presenter-rs canvas [host[:port]] [--name NAME]
 //!                                        an output window that receives slides over the network
 
@@ -24,13 +25,16 @@
 
 mod app;
 mod bible;
+mod cli;
 mod client_app;
 mod clock;
+mod desktop_guard;
 mod formats;
 mod i18n;
 mod model;
 mod net;
 mod peek;
+mod remote;
 mod render;
 mod screens;
 mod settings;
@@ -49,7 +53,31 @@ fn main() {
     install_crash_reporter();
     rotate_crash_log();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    start_guard::set_canvas(args.first().map(String::as_str) == Some("canvas"));
+    let canvas = args.first().map(String::as_str) == Some("canvas");
+    let options = if canvas {
+        cli::Options::default()
+    } else {
+        let wants_console = !args.is_empty();
+        if wants_console {
+            cli::attach_console(args.iter().any(|a| a == "--cli"));
+        }
+        match cli::parse(&args) {
+            Ok(cli::Parsed::Help) => {
+                print!("{}", cli::help());
+                return;
+            }
+            Ok(cli::Parsed::Version) => {
+                println!("oh-presenter-rs {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            Ok(cli::Parsed::Run(o)) => o,
+            Err(e) => {
+                eprintln!("oh-presenter-rs: {e}");
+                std::process::exit(2);
+            }
+        }
+    };
+    start_guard::set_canvas(canvas);
     // a broken graphics driver (or a computer without a GPU, e.g. a VM) can make the
     // default wgpu renderer fail; then the OpenGL (glow) renderer gets a chance. A driver
     // that crashed or hung the last start makes this start try the other one first.
@@ -63,7 +91,7 @@ fn main() {
         // only the first attempt of a start that was not forced gets restarted by the watchdog
         start_guard::attempt(renderer, forced.is_none() && i == 0);
         // a renderer can also panic while it starts (the panic is already logged)
-        let result = std::panic::catch_unwind(|| run(&args, renderer))
+        let result = std::panic::catch_unwind(|| run(&args, &options, renderer))
             .unwrap_or_else(|p| Err(eframe::Error::AppCreation(panic_message(&*p).into())));
         match result {
             Ok(()) => return,
@@ -77,7 +105,7 @@ fn main() {
     fatal_error(&format!("oh! Presenter could not start.\n\n{}", errors.join("\n\n")));
 }
 
-fn run(args: &[String], renderer: eframe::Renderer) -> eframe::Result {
+fn run(args: &[String], options: &cli::Options, renderer: eframe::Renderer) -> eframe::Result {
     if args.first().map(String::as_str) == Some("canvas") {
         let mut server = None;
         let mut name = hostname();
@@ -112,26 +140,47 @@ fn run(args: &[String], renderer: eframe::Renderer) -> eframe::Result {
             }),
         );
     }
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+    // transparent windows (an overlay output) only when asked for: some drivers make every
+    // window of the program a little transparent or slower with it
+    let transparent = settings::Settings::load().output_transparent;
+    let native = eframe::NativeOptions {
+        viewport: main_viewport(options.cli, transparent),
+        renderer,
+        wgpu_options: wgpu_options(),
+        ..Default::default()
+    };
+    let options = options.clone();
+    eframe::run_native(
+        "oh-presenter-rs",
+        native,
+        Box::new(move |cc| {
+            started();
+            Ok(Box::new(app::App::with_options(cc, options)))
+        }),
+    )
+}
+
+/// The program's window: the presenter, or (`cli`) the output alone. `transparent`: created
+/// transparent, so a transparent output shows what is behind it (eframe makes every window
+/// of the program like its first one).
+pub fn main_viewport(cli: bool, transparent: bool) -> eframe::egui::ViewportBuilder {
+    let viewport = if cli {
+        // `--cli`: the only window is the output
+        eframe::egui::ViewportBuilder::default()
+            .with_title("oh! Presenter — output")
+            .with_app_id(app_id("oh-presenter-rs"))
+            .with_icon(icon())
+            .with_inner_size([960.0, 540.0])
+    } else {
+        eframe::egui::ViewportBuilder::default()
             .with_title("oh! Presenter")
             // matches the .desktop file (StartupWMClass), so Linux docks show the right icon
             .with_app_id(app_id("oh-presenter-rs"))
             .with_icon(icon())
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 500.0]),
-        renderer,
-        wgpu_options: wgpu_options(),
-        ..Default::default()
+            .with_min_inner_size([800.0, 500.0])
     };
-    eframe::run_native(
-        "oh-presenter-rs",
-        options,
-        Box::new(|cc| {
-            started();
-            Ok(Box::new(app::App::new(cc)))
-        }),
-    )
+    viewport.with_transparent(transparent)
 }
 
 /// Set once a renderer works and the app is being created: from then on a panic of the

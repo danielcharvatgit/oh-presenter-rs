@@ -220,10 +220,12 @@ impl App {
             if self.service.items.is_empty() {
                 ui.weak(t("service.empty"));
             }
+            self.service_row_ids.clear();
             for (i, item) in self.service.items.iter().enumerate() {
                 let sel = self.sel_item == Some(ItemRef::Service(i));
                 let live = matches!(self.live_pos, Some((ItemRef::Service(l), _)) if l == i);
                 let (rect, r) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ITEM_ROW_H), Sense::click());
+                self.service_row_ids.push(r.id);
                 let visuals = ui.style().interact_selectable(&r, sel);
                 let painter = ui.painter_at(rect);
                 if sel || r.hovered() {
@@ -262,10 +264,13 @@ impl App {
                         ("service.move_up", "up"),
                         ("service.move_down", "down"),
                         ("service.edit", "edit"),
+                        ("service.rename", "rename"),
                         ("service.duplicate", "dup"),
                         ("service.remove", "remove"),
                     ] {
-                        if ui.button(t(key)).clicked() {
+                        let b = ui.button(t(key));
+                        let b = if act == "rename" { b.on_hover_text(sc.describe(Action::RenameItem)) } else { b };
+                        if b.clicked() {
                             action = Some((i, act));
                             ui.close();
                         }
@@ -290,6 +295,9 @@ impl App {
                 if ui.button("✏").on_hover_text(t("service.edit")).clicked() {
                     action = Some((i, "edit"));
                 }
+                if ui.button("🏷").on_hover_text(format!("{} ({})", t("service.rename"), sc.describe(Action::RenameItem))).clicked() {
+                    action = Some((i, "rename"));
+                }
                 if ui.button("✖").on_hover_text(t("service.remove")).clicked() {
                     action = Some((i, "remove"));
                 }
@@ -300,7 +308,7 @@ impl App {
         }
     }
 
-    fn item_action(&mut self, i: usize, act: &str) {
+    pub(super) fn item_action(&mut self, i: usize, act: &str) {
         let n = self.service.items.len();
         if i >= n {
             return;
@@ -363,8 +371,36 @@ impl App {
                 self.sel_slide = 0;
                 self.go_live();
             }
+            "rename" => {
+                self.sel_item = Some(ItemRef::Service(i));
+                self.open_rename_dialog();
+            }
             _ => {}
         }
+    }
+
+    /// F2: asks for a new name of the selected service item.
+    pub fn open_rename_dialog(&mut self) {
+        let Some(ItemRef::Service(i)) = self.sel_item else { return };
+        let Some(item) = self.service.items.get(i) else { return };
+        if self.dialog.is_some() {
+            return;
+        }
+        self.rename_text = item.title();
+        self.dialog = Some(super::Dialog::RenameItem(i));
+    }
+
+    /// Gives service item `i` the name shown in the service; an empty name (or the item's
+    /// own title) shows its own title again.
+    pub fn rename_item(&mut self, i: usize, name: &str) -> bool {
+        let Some(item) = self.service.items.get_mut(i) else { return false };
+        let name = name.trim();
+        let name = if name == item.own_title() { "" } else { name };
+        if item.name != name {
+            item.name = name.to_string();
+            self.service_dirty = true;
+        }
+        true
     }
 
     fn add_menu(&mut self, ui: &mut egui::Ui) {

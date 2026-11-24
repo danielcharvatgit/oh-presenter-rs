@@ -90,7 +90,7 @@ impl App {
         }
     }
 
-    fn switch_bible(&mut self, id: &str) {
+    pub(super) fn switch_bible(&mut self, id: &str) {
         self.bible.current = Bible::load(id);
         self.bible.offer_index = None;
         self.bible.book_hint = None;
@@ -161,7 +161,7 @@ impl App {
         Some(Passage { reference: bible.format_reference(&hits, &lang), version: bible.meta.abbrev.clone(), verses })
     }
 
-    fn bible_show_live(&mut self) {
+    pub(super) fn bible_show_live(&mut self) {
         if let Some(p) = self.bible_selected_passage() {
             let bible = self.bible.current.as_ref().map(|b| b.meta.id.clone()).unwrap_or_default();
             self.bible.bookmarks.visit(Bookmark { reference: p.reference.clone(), bible, note: String::new() });

@@ -68,6 +68,16 @@ pub struct Settings {
     pub alert_default_message: String,
     /// The clock on the output (encoded dots and / or plain digits).
     pub clock: crate::model::ClockStyle,
+    /// Transparent output window: transparent parts of pictures show what is behind it
+    /// (an overlay over another program). Takes effect at the next start.
+    pub output_transparent: bool,
+    /// While the output is full screen on another screen, keys of the desktop that would
+    /// show it on the projector are blocked (Super on GNOME / Cinnamon / Plasma, Win+Tab,
+    /// Win+D, Win+M and Win+, on Windows).
+    pub guard_desktop_keys: bool,
+    /// The MCP server for code agents (on 127.0.0.1 only).
+    pub mcp_enabled: bool,
+    pub mcp_port: u16,
 }
 
 impl Default for Settings {
@@ -95,6 +105,10 @@ impl Default for Settings {
             alert_style: crate::model::AlertStyle::default(),
             alert_default_message: String::new(),
             clock: crate::model::ClockStyle::default(),
+            output_transparent: false,
+            guard_desktop_keys: true,
+            mcp_enabled: false,
+            mcp_port: crate::remote::mcp::DEFAULT_PORT,
         }
     }
 }
@@ -109,10 +123,19 @@ impl Settings {
                 s.marks.push(d);
             }
         }
-        for a in crate::shortcuts::Action::ALL {
-            s.shortcuts.map.entry(*a).or_insert_with(|| a.defaults());
-        }
+        s.upgrade_shortcuts();
         s
+    }
+
+    /// New actions get their default keys; keys that were defaults of an older version and
+    /// changed since (Freeze F8 → ",", Space no longer the next slide) get the new defaults.
+    pub fn upgrade_shortcuts(&mut self) {
+        for a in crate::shortcuts::Action::ALL {
+            let keys = self.shortcuts.map.entry(*a).or_insert_with(|| a.defaults());
+            if a.old_defaults().as_ref() == Some(keys) {
+                *keys = a.defaults();
+            }
+        }
     }
 
     pub fn save(&self) -> std::io::Result<()> {

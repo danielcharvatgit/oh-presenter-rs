@@ -98,6 +98,8 @@ pub enum Action {
     Save,
     /// "Save as" for the service, "save as new" for songs and designs.
     SaveAs,
+    /// Rename the selected service item (Service tab).
+    RenameItem,
     /// Play / pause the video (Service tab: the selected or the live video).
     VideoPlayPause,
     /// Video 5 seconds forward.
@@ -137,6 +139,7 @@ impl Action {
         Action::OpenService,
         Action::Save,
         Action::SaveAs,
+        Action::RenameItem,
         // before the slide keys: on a video they take Space / ← / → first
         Action::VideoPlayPause,
         Action::VideoForward,
@@ -200,6 +203,18 @@ impl Action {
         matches!(self, Action::VideoPlayPause | Action::VideoForward | Action::VideoBack)
     }
 
+    /// Default keys of older versions that were changed since: saved settings with exactly
+    /// these keys get the new defaults (0.1.x: Freeze was F8, Space was also the next slide).
+    pub fn old_defaults(self) -> Option<Vec<KeyBinding>> {
+        use Key::*;
+        let p = KeyBinding::plain;
+        match self {
+            Action::Freeze => Some(vec![p(F8)]),
+            Action::NextSlide => Some(vec![p(ArrowDown), p(PageDown), p(ArrowRight), p(Space)]),
+            _ => None,
+        }
+    }
+
     pub fn defaults(self) -> Vec<KeyBinding> {
         use Key::*;
         let p = KeyBinding::plain;
@@ -209,10 +224,12 @@ impl Action {
             Action::OpenService => vec![c(O)],
             Action::Save => vec![c(S)],
             Action::SaveAs => vec![KeyBinding::ctrl_shift(S)],
+            Action::RenameItem => vec![p(F2)],
             Action::VideoPlayPause => vec![p(Space)],
             Action::VideoForward => vec![p(ArrowRight)],
             Action::VideoBack => vec![p(ArrowLeft)],
-            Action::NextSlide => vec![p(ArrowDown), p(PageDown), p(ArrowRight), p(Space)],
+            // not Space: that is the video key (play / pause), it never steps slides or items
+            Action::NextSlide => vec![p(ArrowDown), p(PageDown), p(ArrowRight)],
             Action::PrevSlide => vec![p(ArrowUp), p(PageUp), p(ArrowLeft)],
             Action::FirstSlide => vec![p(Home)],
             Action::LastSlide => vec![p(End)],

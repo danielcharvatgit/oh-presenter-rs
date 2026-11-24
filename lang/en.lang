@@ -509,8 +509,27 @@ video.length = Length {time}
 video.play = Play
 video.pause = Pause
 video.restart = Back to the start
-video.keys_hint = Click the video preview (or move to it with Tab), then: Space = play / pause, ← → = 5 seconds back / forward
+video.keys_hint = Space = play / pause the live video (or show the selected video live) anywhere in the Service tab; ← → = 5 seconds back / forward after clicking the video, its preview or the live panel
 
 # pictures
 image.unsupported = This picture format is not supported
 image.needs_ffmpeg = HEIC / HEIF and AVIF pictures are converted with ffmpeg, which was not found (Ubuntu / Debian: sudo apt install ffmpeg)
+
+# 0.2.0: rename, desktop keys, transparent output, MCP
+service.rename = Rename
+service.rename_hint = The name shown in the service. Empty = the item's own title ({title}).
+action.RenameItem = Rename the selected service item
+output.fullscreen_restored = The desktop took the output out of full screen (a key of the window manager?): it was put back
+settings.advanced = Advanced settings
+settings.transparent = Transparent output (pictures with transparency are an overlay)
+settings.transparent_hint = Transparent parts of a picture (PNG with an alpha channel) show what is behind the output window, e.g. a trailer played in another video player under it. Turn on "keep above all other windows" too. Needs a desktop with compositing (Windows, GNOME, Plasma, Cinnamon, Hyprland…). Takes effect at the next start.
+settings.guard_keys = Keep the desktop off the projector while presenting
+settings.guard_keys_hint = While the output is full screen on another screen: GNOME / Ubuntu, Cinnamon and KDE Plasma — the Super (Windows) key does not open the overview or menu; Windows — Win+Tab, Win+D, Win+M and Win+, are blocked. The settings of the desktop are put back afterwards. On every desktop (also Hyprland, X11 and Wayland) the output is put back into full screen when a key of the window manager takes it out.
+settings.mcp = MCP server
+settings.mcp_enabled = Let code agents control the program (MCP)
+settings.mcp_hint = Code agents (Claude Code, other MCP clients) on this computer can then do everything the buttons of the program do, except the slide designer: the service, slides, videos, the output window, alerts, bibles and settings. Only programs on this computer can connect.
+settings.mcp_error = The MCP server could not start: {err}
+settings.mcp_running = The MCP server runs at {url}. Connect a code agent, e.g.:
+settings.mcp_off = The MCP server is off.
+settings.mcp_cli_hint = Without the program window: oh-presenter-rs --cli (see oh-presenter-rs --help); --mcp starts this server there too.
+settings.copy = Copy

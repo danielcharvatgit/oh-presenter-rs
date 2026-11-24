@@ -7,6 +7,7 @@ mod designer_tab;
 pub(crate) mod files;
 mod keynav;
 mod legacy;
+mod remote_cmd;
 mod service_tab;
 mod settings_tab;
 mod songs_tab;
@@ -115,6 +116,8 @@ pub enum Dialog {
     /// The output is full screen on another screen (the operator does not see it): leave
     /// full screen / close it only when confirmed here.
     LeaveOutput(OutputChange),
+    /// Rename a service item (F2); the name is typed into `App::rename_text`.
+    RenameItem(usize),
 }
 
 /// A change of the output window that is confirmed first while it is full screen on
@@ -235,6 +238,18 @@ pub struct OutputShared {
     jump: Option<(String, Option<u32>)>,
     fullscreen: Option<bool>,
     close: bool,
+    /// Esc was pressed in the output window.
+    escape: bool,
+    /// The output must stay full screen (it is on another screen): put it back when the
+    /// desktop takes it out ([`keep_output_fullscreen`]).
+    guard_fullscreen: bool,
+    /// Since when the output window is out of full screen without being asked to.
+    lost_since: Option<Instant>,
+    /// The output window was put back into full screen (the main window warns).
+    lost_fullscreen: bool,
+    /// Transparent output: what is behind the window shows through transparent pictures
+    /// (setting `output_transparent`, the windows are created transparent at the start).
+    transparent: bool,
 }
 
 pub struct App {
@@ -320,10 +335,49 @@ pub struct App {
     output_was_open: bool,
     /// The Service tab's columns on the last frame (for the keyboard, see service_tab).
     service_cols: service_tab::Columns,
+    /// Ids of the rows of the service item list (last frame): Space there is the video key.
+    service_row_ids: Vec<egui::Id>,
+    /// The name typed in the rename dialog (F2).
+    pub rename_text: String,
+    /// `--cli`: no program window, the root window is the output (see [`crate::cli`]).
+    pub cli: bool,
+    /// Commands from the command line and the MCP server (see [`crate::remote`]).
+    remote_rx: std::sync::mpsc::Receiver<crate::remote::Request>,
+    remote_tx: std::sync::mpsc::Sender<crate::remote::Request>,
+    /// The MCP server while it is on (Settings › Advanced), and why it could not start.
+    mcp: Option<crate::remote::mcp::Server>,
+    pub mcp_error: Option<String>,
+    /// The MCP server is on whatever the settings say (`--mcp` on the command line).
+    pub mcp_forced: bool,
+    /// Keeps the desktop's keys off the projector while presenting (created when needed).
+    desktop_guard: Option<crate::desktop_guard::Guard>,
+    /// The windows were created transparent (setting `output_transparent` at the start).
+    transparent_windows: bool,
+    /// For the threads that send commands (they wake the UI up).
+    remote_ctx: Option<egui::Context>,
+    /// Commands of the command line's options, run once the library is loaded.
+    pub startup_commands: Vec<(String, serde_json::Map<String, serde_json::Value>)>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext) -> Self {
+    /// The program as the command line asks for it (see [`crate::cli`]).
+    pub fn with_options(cc: &eframe::CreationContext, options: crate::cli::Options) -> Self {
+        let mut app = Self::new_inner(cc, options.cli, !options.windowed);
+        app.mcp_forced = options.mcp;
+        if let Some(port) = options.mcp_port {
+            app.settings.mcp_port = port;
+        }
+        app.startup_commands = options.startup_commands();
+        if options.cli {
+            // commands typed on the command line
+            let sender = app.remote_sender(&cc.egui_ctx);
+            std::thread::spawn(move || crate::remote::stdin_loop(sender));
+            println!("oh! Presenter {} — type help for the commands, quit to end", env!("CARGO_PKG_VERSION"));
+        }
+        app
+    }
+
+    fn new_inner(cc: &eframe::CreationContext, cli: bool, fullscreen: bool) -> Self {
         let settings = Settings::load();
         crate::i18n::load_dir(&storage::paths().lang());
         crate::i18n::set_language(&settings.language);
@@ -331,6 +385,11 @@ impl App {
         let loading = startup::Loading::start(&cc.egui_ctx, settings.bible.clone());
         let mut app = Self::with_loaded(&cc.egui_ctx, settings, startup::Loaded::empty());
         app.loading = Some(loading);
+        if cli {
+            app.cli = true;
+            app.output_open = true;
+            app.output_fullscreen = fullscreen;
+        }
         if let Some(window) = cc.winit_window() {
             app.place_windows(window);
         }
@@ -345,6 +404,7 @@ impl App {
     }
 
     fn with_loaded(ctx: &egui::Context, settings: Settings, loaded: startup::Loaded) -> Self {
+        let (remote_tx, remote_rx) = std::sync::mpsc::channel();
         render::install_fonts(ctx, None);
         // Ctrl+Q goes through our own (customisable) Quit action, which asks first
         ctx.options_mut(|o| o.quit_shortcuts.clear());
@@ -431,6 +491,19 @@ impl App {
             placement_tries: 0,
             output_was_open: false,
             service_cols: Default::default(),
+            service_row_ids: Vec::new(),
+            rename_text: String::new(),
+            cli: false,
+            remote_rx,
+            remote_tx,
+            mcp: None,
+            mcp_error: None,
+            mcp_forced: false,
+            // made at the start: it puts back desktop settings a crashed run left changed
+            desktop_guard: Some(crate::desktop_guard::Guard::for_this_computer()),
+            transparent_windows: settings.output_transparent,
+            remote_ctx: Some(ctx.clone()),
+            startup_commands: Vec::new(),
             legacy: None,
             alert: None,
             alert_text: String::new(),
@@ -457,6 +530,11 @@ impl App {
                 monitors: Vec::new(),
                 placing: None,
                 on_screen: None,
+                escape: false,
+                guard_fullscreen: false,
+                lost_since: None,
+                lost_fullscreen: false,
+                transparent: settings.output_transparent,
             })),
             settings,
         };
@@ -1319,8 +1397,9 @@ impl App {
                 Action::ToggleLive => self.set_live_mode(!self.settings.live_follows_selection),
                 Action::Blank => self.toggle_blank(),
                 Action::Freeze => self.toggle_freeze(),
+                Action::RenameItem => self.open_rename_dialog(),
                 Action::VideoPlayPause => {
-                    if let Some(target) = self.video_key_target() {
+                    if let Some(target) = self.play_pause_target() {
                         self.video_play_pause(target);
                     }
                 }
@@ -1376,7 +1455,9 @@ impl App {
         match a {
             Action::PinPassage => self.tab == Tab::Bible,
             Action::Undo | Action::Redo => self.tab == Tab::Designer,
-            Action::VideoPlayPause | Action::VideoForward | Action::VideoBack => self.video_key_target().is_some(),
+            Action::RenameItem => self.tab == Tab::Service && matches!(self.sel_item, Some(ItemRef::Service(_))),
+            Action::VideoPlayPause => self.play_pause_target().is_some(),
+            Action::VideoForward | Action::VideoBack => self.video_key_target().is_some(),
             // arrow keys move objects in the designer
             a if a.is_navigation() => self.presenting(),
             _ => true,
@@ -1450,6 +1531,8 @@ impl App {
         }
         let scene = self.output_scene();
         let mut save = false;
+        let mut lost = false;
+        let escape;
         let (actions, jump, fullscreen, close) = {
             let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
             if opening {
@@ -1474,6 +1557,7 @@ impl App {
                 ctx.request_repaint_of(output_id());
             }
             o.keys_enabled = self.capture.is_none() && self.dialog.is_none() && self.file_dialog.is_none();
+            o.guard_fullscreen = self.output_on_other_screen();
             // a window (not full screen) shows the pointer, so it can be moved and resized
             o.hide_cursor = self.settings.output_always_on_top && self.output_fullscreen;
             o.shortcuts = self.settings.shortcuts.clone();
@@ -1488,86 +1572,28 @@ impl App {
                 // saved below, once the output's state is let go
                 save = true;
             }
+            if std::mem::take(&mut o.lost_fullscreen) {
+                lost = true;
+            }
+            escape = std::mem::take(&mut o.escape);
             (std::mem::take(&mut o.actions), o.jump.take(), o.fullscreen.take(), std::mem::take(&mut o.close))
         };
+        if lost {
+            self.warn_desktop_took_output(ctx);
+        }
         if save {
             self.save_settings();
         }
         let shared = self.output.clone();
         let title = t("output.title");
-        // created as an ordinary window, then put on its screen (see Placing)
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title.clone())
-            .with_inner_size([960.0, 540.0])
-            .with_window_level(if self.settings.output_always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
-        ctx.show_viewport_deferred(output_id(), builder, move |ui, _class| {
-            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let o = &mut *guard;
-            let vctx = ui.ctx().clone();
-            vctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
-            let rect = ui.max_rect();
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
-            let textures = o.textures.get_or_insert_with(|| TextureCache::new(storage::paths().media()));
-            let slide = render::fit_16_9(rect);
-            render::draw_scene_live(&painter, slide, &o.scene, textures);
-            if let Some((alert, since)) = &o.alert
-                && render::draw_alert(&painter, slide, alert, since.elapsed().as_secs_f32())
-            {
-                // ~60 frames per second while it runs
-                vctx.request_repaint_after(std::time::Duration::from_millis(16));
-            }
-            if o.clock.show {
-                let secs = crate::clock::now_secs();
-                crate::clock::draw(&painter, rect, slide.width(), &o.clock, secs);
-                vctx.request_repaint_after(crate::clock::repaint_in(&o.clock, secs));
-            }
-            let mut wake_main = false;
-            // double click toggles fullscreen, Esc leaves it
-            let resp = ui.interact(rect, egui::Id::unique("output_area"), egui::Sense::click());
-            if resp.double_clicked() {
-                o.fullscreen = Some(true);
-                wake_main = true;
-            }
-            if vctx.input(|i| i.key_pressed(Key::Escape)) {
-                o.fullscreen = Some(false);
-                wake_main = true;
-            }
-            if vctx.input(|i| i.viewport().close_requested()) {
-                o.close = true;
-                wake_main = true;
-            }
-            if o.keys_enabled && vctx.input(|i| i.focused) {
-                let focus = shortcuts::KeyFocus::of(&vctx, false);
-                let actions = o
-                    .shortcuts
-                    .triggered(&vctx, focus, |a| a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen));
-                if let Some(j) = o.mark_keys.consume(&vctx, shortcuts::KeyFocus::None) {
-                    o.jump = Some(j);
-                    wake_main = true;
-                }
-                if !actions.is_empty() {
-                    o.actions.extend(actions);
-                    wake_main = true;
-                }
-            }
-            // Windows Peek (the taskbar previews) must not hide the projected picture
-            if o.peek_marked.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2)) {
-                o.peek_marked = crate::peek::keep_shown(&title).then(Instant::now);
-                if o.peek_marked.is_none() {
-                    vctx.request_repaint_after(std::time::Duration::from_millis(200));
-                }
-            }
-            place_output_window(o, &vctx);
-            if o.hide_cursor {
-                // the pointer would show on the projector when moved over to it
-                vctx.set_cursor_icon(egui::CursorIcon::None);
-            }
-            if wake_main {
-                // the main window does the work (and sends the new slide back here)
-                vctx.request_repaint_of(ViewportId::ROOT);
-            }
-        });
+        let builder = self.output_viewport(&title);
+        // `--cli`: the program's own window is the output, drawn by `frame`
+        if !self.cli {
+            ctx.show_viewport_deferred(output_id(), builder, move |ui, _class| {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                output_frame(ui, &mut guard, &title, false);
+            });
+        }
         self.handle_actions(actions, ctx);
         if let Some((code, n)) = jump {
             self.jump_to_mark(&code, n);
@@ -1583,10 +1609,40 @@ impl App {
             Some(_) if self.output_fullscreen => self.request_output_change(OutputChange::Windowed, ctx),
             _ => {}
         }
+        if escape {
+            match self.dialog {
+                // Esc in the output window answers the question about it: Cancel (the output
+                // window often keeps the keyboard: Wayland does not let the main window take it)
+                Some(Dialog::LeaveOutput(_)) => {
+                    self.dialog = None;
+                    ctx.request_repaint();
+                }
+                // Esc on the full screen output: out of it (asked first on another screen)
+                None if self.output_fullscreen => self.request_output_change(OutputChange::Windowed, ctx),
+                _ => {}
+            }
+        }
         if close {
             // a child window stays open as long as it is shown: not closing = cancelled
             self.request_output_change(OutputChange::CloseButton, ctx);
         }
+    }
+
+    /// The desktop took the output out of full screen (it was put back): tells the operator.
+    fn warn_desktop_took_output(&mut self, ctx: &egui::Context) {
+        self.notify(t("output.fullscreen_restored"));
+        ctx.request_repaint_of(ViewportId::ROOT);
+    }
+
+    /// The output window: created as an ordinary window, then put on its screen (see
+    /// [`Placing`]); transparent when the program's windows are (eframe's wgpu renderer does
+    /// not make child windows like the first one by itself).
+    pub fn output_viewport(&self, title: &str) -> egui::ViewportBuilder {
+        egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([960.0, 540.0])
+            .with_transparent(self.transparent_windows)
+            .with_window_level(if self.settings.output_always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal })
     }
 
     /// The output window is full screen on another screen than the program's, where the
@@ -1889,6 +1945,31 @@ impl App {
                         btn(ui, t("cancel"), None);
                     });
                 }
+                Dialog::RenameItem(i) => {
+                    let i = *i;
+                    ui.heading(t("service.rename"));
+                    let own = self.service.items.get(i).map(|it| it.own_title()).unwrap_or_default();
+                    ui.weak(tf("service.rename_hint", &[("title", &own)]));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.rename_text).desired_width(400.0));
+                    if !r.has_focus() && !r.lost_focus() {
+                        r.request_focus();
+                    }
+                    let enter = r.lost_focus() && ui.input(|inp| inp.key_pressed(Key::Enter));
+                    ui.add_space(8.0);
+                    let name = self.rename_text.clone();
+                    let rename: DialogAction = Box::new(move |app| {
+                        app.rename_item(i, &name);
+                    });
+                    if enter {
+                        close = true;
+                        next = Some(rename);
+                    } else {
+                        ui.horizontal(|ui| {
+                            btn(ui, t("ok"), Some(rename));
+                            btn(ui, t("cancel"), None);
+                        });
+                    }
+                }
                 Dialog::DeleteBible(id) => {
                     let name = self.bible.bibles.iter().find(|b| &b.id == id).map(|b| b.name.clone()).unwrap_or_default();
                     ui.label(tf("dialog.delete_bible", &[("name", &name)]));
@@ -2139,6 +2220,113 @@ impl App {
     }
 }
 
+/// One frame of the output window (or of the program's window in `--cli` mode, `root`):
+/// the live picture, the alert and clock, its keys, and putting it on its screen.
+fn output_frame(ui: &mut egui::Ui, o: &mut OutputShared, title: &str, root: bool) {
+    let vctx = ui.ctx().clone();
+    vctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
+    let rect = ui.max_rect();
+    let painter = ui.painter_at(rect);
+    if render::paints_black_behind(o.transparent, &o.scene) {
+        painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+    }
+    let textures = o.textures.get_or_insert_with(|| TextureCache::new(storage::paths().media()));
+    let slide = render::fit_16_9(rect);
+    render::draw_scene_live(&painter, slide, &o.scene, textures);
+    if let Some((alert, since)) = &o.alert
+        && render::draw_alert(&painter, slide, alert, since.elapsed().as_secs_f32())
+    {
+        // ~60 frames per second while it runs
+        vctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    if o.clock.show {
+        let secs = crate::clock::now_secs();
+        crate::clock::draw(&painter, rect, slide.width(), &o.clock, secs);
+        vctx.request_repaint_after(crate::clock::repaint_in(&o.clock, secs));
+    }
+    let mut wake_main = false;
+    // double click toggles fullscreen, Esc leaves it (or cancels the question about it)
+    let resp = ui.interact(rect, egui::Id::unique("output_area"), egui::Sense::click());
+    if resp.double_clicked() {
+        o.fullscreen = Some(true);
+        wake_main = true;
+    }
+    if vctx.input(|i| i.key_pressed(Key::Escape)) {
+        o.escape = true;
+        wake_main = true;
+    }
+    if !root && vctx.input(|i| i.viewport().close_requested()) {
+        o.close = true;
+        wake_main = true;
+    }
+    if o.keys_enabled && vctx.input(|i| i.focused) {
+        let focus = shortcuts::KeyFocus::of(&vctx, false);
+        let actions = o.shortcuts.triggered(&vctx, focus, |a| {
+            a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen | Action::VideoPlayPause)
+        });
+        if let Some(j) = o.mark_keys.consume(&vctx, shortcuts::KeyFocus::None) {
+            o.jump = Some(j);
+            wake_main = true;
+        }
+        if !actions.is_empty() {
+            o.actions.extend(actions);
+            wake_main = true;
+        }
+    }
+    // Windows Peek (the taskbar previews) must not hide the projected picture
+    if o.peek_marked.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2)) {
+        o.peek_marked = crate::peek::keep_shown(title).then(Instant::now);
+        if o.peek_marked.is_none() {
+            vctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+    keep_output_fullscreen(o, &vctx);
+    place_output_window(o, &vctx);
+    if o.hide_cursor {
+        // the pointer would show on the projector when moved over to it
+        vctx.set_cursor_icon(egui::CursorIcon::None);
+    }
+    if wake_main && !root {
+        // the main window does the work (and sends the new slide back here)
+        vctx.request_repaint_of(ViewportId::ROOT);
+    } else if wake_main {
+        vctx.request_repaint();
+    }
+}
+
+/// How long the output window has to be out of full screen (or minimized) without the
+/// program asking for it before it is put back.
+const LOST_FULLSCREEN_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The output should be full screen on another screen, but the desktop took it out of full
+/// screen or minimized it (a key of the window manager: Super+↓ on GNOME, a Hyprland bind,
+/// Win+D on Windows, …): it is put back, and the main window shows a warning.
+fn keep_output_fullscreen(o: &mut OutputShared, vctx: &egui::Context) {
+    if !o.guard_fullscreen || o.placing.is_some() {
+        o.lost_since = None;
+        return;
+    }
+    let (fullscreen, minimized) = vctx.input(|i| (i.viewport().fullscreen, i.viewport().minimized));
+    let lost = fullscreen == Some(false) || minimized == Some(true);
+    if !lost {
+        o.lost_since = None;
+        return;
+    }
+    let since = *o.lost_since.get_or_insert_with(Instant::now);
+    if since.elapsed() < LOST_FULLSCREEN_AFTER {
+        vctx.request_repaint_after(LOST_FULLSCREEN_AFTER);
+        return;
+    }
+    crate::log_info(&format!("output window left full screen by itself (fullscreen {fullscreen:?}, minimized {minimized:?}): put back"));
+    o.lost_since = None;
+    if minimized == Some(true) {
+        vctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+    }
+    o.placing = Some(Placing { next_at: Instant::now(), ..Placing::new(true) });
+    o.lost_fullscreen = true;
+    vctx.request_repaint_of(ViewportId::ROOT);
+}
+
 /// Runs in the output window (each of its frames): the next step of putting it on its
 /// screen, once the last step had time to take effect. Every step is written to start.log.
 fn place_output_window(o: &mut OutputShared, vctx: &egui::Context) {
@@ -2245,12 +2433,99 @@ pub fn output_id() -> ViewportId {
     ViewportId::from_hash_of("oh-presenter-output")
 }
 
+impl App {
+    /// Sends commands to this program (the command line, the MCP server).
+    pub fn remote_sender(&self, ctx: &egui::Context) -> crate::remote::Sender {
+        crate::remote::Sender::new(self.remote_tx.clone(), ctx.clone())
+    }
+
+    /// Runs the commands that came from the command line / the MCP server.
+    fn poll_remote(&mut self, ctx: &egui::Context) {
+        while let Ok(req) = self.remote_rx.try_recv() {
+            if std::time::Instant::now() > req.deadline {
+                // its sender stopped waiting: it is not done later behind its back
+                continue;
+            }
+            let out = self.run_command(&req.name, &req.args, ctx);
+            let _ = req.reply.send(out);
+        }
+    }
+
+    /// Starts / stops the MCP server as the settings say.
+    fn sync_mcp(&mut self) {
+        let want = (self.settings.mcp_enabled || self.mcp_forced).then_some(self.settings.mcp_port);
+        if self.mcp.as_ref().map(|s| s.port) == want {
+            return;
+        }
+        if want.is_none() {
+            self.mcp = None;
+            self.mcp_error = None;
+            return;
+        }
+        // a port that failed is not tried again on every frame (only after a change)
+        if self.mcp_error.as_ref().is_some_and(|e| e.starts_with(&format!("127.0.0.1:{}:", self.settings.mcp_port))) {
+            return;
+        }
+        self.mcp = None;
+        if self.settings.mcp_port < 1024 {
+            self.mcp_error = Some(format!("127.0.0.1:{}: the port must be 1024–65535", self.settings.mcp_port));
+            return;
+        }
+        let ctx = self.remote_ctx.clone();
+        match ctx.map(|c| crate::remote::mcp::Server::start(self.settings.mcp_port, self.remote_sender(&c))) {
+            Some(Ok(s)) => {
+                self.mcp = Some(s);
+                self.mcp_error = None;
+            }
+            Some(Err(e)) => {
+                crate::log_error(&format!("MCP server: {e}"));
+                self.mcp_error = Some(e);
+            }
+            None => {}
+        }
+    }
+
+    /// The desktop's keys are off while the output is full screen on another screen.
+    fn sync_desktop_guard(&mut self) {
+        let want = self.settings.guard_desktop_keys && self.output_on_other_screen();
+        if let Some(g) = &mut self.desktop_guard {
+            g.set(want);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn desktop_guard_engaged(&self) -> bool {
+        self.desktop_guard.as_ref().is_some_and(|g| g.engaged())
+    }
+
+    #[cfg(test)]
+    pub fn mcp_port(&self) -> Option<u16> {
+        self.mcp.as_ref().map(|s| s.port)
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if self.root_window.is_none() {
             self.root_window = frame.winit_window().cloned();
         }
         self.frame(ui);
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.transparent_windows {
+            // the output window lets what is behind it show (the main window paints its own
+            // background, see `frame`)
+            [0.0; 4]
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(g) = &mut self.desktop_guard {
+            g.set(false);
+        }
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -2268,6 +2543,11 @@ impl App {
             // the start is confirmed a few frames in (see start_guard)
             ctx.request_repaint();
         }
+        if self.transparent_windows && !self.cli {
+            // the window is transparent (for the output's sake): the program is not
+            let fill = ctx.global_style().visuals.panel_fill;
+            ctx.layer_painter(egui::LayerId::background()).rect_filled(ui.max_rect(), 0.0, fill);
+        }
         self.retry_placement(&ctx);
         if let Some(pos) = self.pending_main_position.take() {
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
@@ -2275,7 +2555,10 @@ impl App {
         if self.poll_loading() {
             // the projector goes black right away; the program shows after loading
             self.show_output(&ctx);
-            if let Some(loading) = &mut self.loading {
+            if self.cli {
+                // `--cli`: this window is the projector, which stays black meanwhile
+                ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::BLACK);
+            } else if let Some(loading) = &mut self.loading {
                 loading.show(ui);
             }
             return;
@@ -2283,6 +2566,34 @@ impl App {
 
         ctx.input_mut(|i| shortcuts::digits_by_position(&mut i.events));
 
+        if !self.startup_commands.is_empty() {
+            // the command line's options, now that the library is there
+            for (name, args) in std::mem::take(&mut self.startup_commands) {
+                match self.run_command(&name, &args, &ctx) {
+                    Ok(out) if self.cli => println!("{name}: {}", out.lines().next().unwrap_or_default()),
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("oh-presenter-rs: {name}: {e}");
+                        if !self.cli {
+                            self.error(format!("{name}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if self.cli {
+            // no program window to ask in: closing the output ends the program, and messages
+            // go to the command line
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.quit_confirmed = true;
+            }
+            if let Some(d) = self.dialog.take() {
+                match d {
+                    Dialog::Message(m) => eprintln!("{m}"),
+                    other => crate::log_info(&format!("--cli: dialog {other:?} dropped")),
+                }
+            }
+        }
         // closing the main window always asks first (and offers to save unsaved work)
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -2291,8 +2602,14 @@ impl App {
             }
         }
         if self.quit_confirmed {
+            // the desktop's keys come back before the program ends
+            if let Some(g) = &mut self.desktop_guard {
+                g.set(false);
+            }
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
+        self.poll_remote(&ctx);
+        self.sync_mcp();
 
         self.poll_file_dialog(&ctx);
         self.poll_legacy_scan(&ctx);
@@ -2312,6 +2629,14 @@ impl App {
             self.capture = None;
         }
         self.show_output(&ctx);
+        self.sync_desktop_guard();
+        if self.cli {
+            // `--cli`: this window is the output; nothing else is shown
+            let shared = self.output.clone();
+            let mut o = shared.lock().unwrap_or_else(|e| e.into_inner());
+            egui::CentralPanel::no_frame().show(ui, |ui| output_frame(ui, &mut o, &t("output.title"), true));
+            return;
+        }
         if ctx.input(|i| i.focused) {
             self.video_keys(&ctx);
             self.service_column_keys(&ctx);
@@ -2364,8 +2689,26 @@ impl App {
     /// or its close button; handled on the next frame.
     pub fn output_reports(&self, fullscreen: Option<bool>, close: bool) {
         let mut o = self.output.lock().unwrap_or_else(|e| e.into_inner());
-        o.fullscreen = fullscreen;
+        match fullscreen {
+            Some(false) => o.escape = true,
+            f => o.fullscreen = f,
+        }
         o.close = close;
+    }
+
+    /// The id of row `i` of the service item list (last frame).
+    pub fn service_row_id_for_test(&self, i: usize) -> Option<egui::Id> {
+        self.service_row_ids.get(i).copied()
+    }
+
+    /// The output window is where it should be (no placing steps left).
+    pub fn output_placing_done(&self) {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).placing = None;
+    }
+
+    /// Whether the output window is being put (back) on its screen.
+    pub fn output_placing(&self) -> bool {
+        self.output.lock().unwrap_or_else(|e| e.into_inner()).placing.is_some()
     }
 
     /// Whether the output window hides the mouse pointer (as set on the last frame).

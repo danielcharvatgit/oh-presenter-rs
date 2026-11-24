@@ -138,7 +138,7 @@ impl App {
             Ok(l) => self.apply_loaded(l),
             Err(()) => self.dialog = Some(Dialog::Message(t("startup.load_failed"))),
         }
-        if !self.settings.legacy_import_answered {
+        if !self.settings.legacy_import_answered && !self.cli {
             // first run (until answered): look for files of the old oh-presenter
             self.start_legacy_scan(false);
         }
@@ -211,6 +211,7 @@ impl App {
         // (not possible on Wayland, which also has no primary screen)
         if let (Some(main), Some(cur)) = (plan.main, current)
             && main != cur
+            && !self.cli
         {
             let size = window.outer_size();
             let (x, y) = screens::centered_on(&monitors[main], (size.width, size.height));
@@ -222,7 +223,11 @@ impl App {
         self.main_monitor = plan.main;
         self.monitors.clone_from(&monitors);
         self.screen_names = monitors.iter().map(|m| if m.name.is_empty() { "?".to_string() } else { m.name.clone() }).collect();
-        if self.settings.output_on_second_screen && self.output_monitor.is_some() {
+        if self.cli {
+            // `--cli`: this window is the output; there is no program window, so the output
+            // may also go on the screen it opened on (`main` is only the screen it starts on)
+            self.output_open = true;
+        } else if self.settings.output_on_second_screen && self.output_monitor.is_some() {
             self.output_open = true;
             self.output_fullscreen = true;
         }

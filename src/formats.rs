@@ -956,14 +956,18 @@ pub fn read_image_file(path: &Path) -> Res<(Vec<u8>, String)> {
 }
 
 pub fn full_screen_image(name: &str, media: String, bytes: &[u8]) -> Design {
-    let (w, h) = image::load_from_memory(bytes).map(|i| (i.width() as f32, i.height() as f32)).unwrap_or((CANVAS_W, CANVAS_H));
+    let img = image::load_from_memory(bytes).ok();
+    let (w, h) = img.as_ref().map(|i| (i.width() as f32, i.height() as f32)).unwrap_or((CANVAS_W, CANVAS_H));
+    // a picture with transparent parts gets a transparent background: shown as an overlay
+    // (over what is behind a transparent output window), else on black
+    let see_through = img.as_ref().is_some_and(|i| i.color().has_alpha() && i.to_rgba8().pixels().any(|p| p.0[3] < 255));
     let s = (CANVAS_W / w).min(CANVAS_H / h);
     let (w, h) = (w * s, h * s);
     Design {
         id: make_id(),
         name: name.to_string(),
         doc: CanvasDoc {
-            background: Rgba::BLACK,
+            background: if see_through { Rgba::TRANSPARENT } else { Rgba::BLACK },
             objects: vec![CanvasObject {
                 id: make_id(),
                 x: (CANVAS_W - w) / 2.0,

@@ -64,6 +64,8 @@ impl App {
             ui.separator();
             changed |= app.settings_shortcuts(ui);
             ui.separator();
+            changed |= app.settings_advanced(ui);
+            ui.separator();
             ui.heading(t("settings.data"));
             ui.label(tf("settings.data_dir", &[("dir", &paths().data.to_string_lossy())]));
             ui.label(tf("settings.config_dir", &[("dir", &paths().config.to_string_lossy())]));
@@ -411,6 +413,68 @@ impl App {
             }
         });
         ui.weak(t("settings.mark_code_hint"));
+        changed
+    }
+
+    /// Settings › Advanced: the transparent output, the desktop's keys, the MCP server.
+    fn settings_advanced(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading(t("settings.advanced"));
+        egui::Grid::new("advanced").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(t("settings.output_window"));
+            let r =
+                ui.checkbox(&mut self.settings.output_transparent, t("settings.transparent")).on_hover_text(t("settings.transparent_hint"));
+            changed |= r.changed();
+            ui.end_row();
+            if self.settings.output_transparent != self.transparent_windows {
+                ui.label("");
+                ui.weak(t("settings.restart"));
+                ui.end_row();
+            }
+            ui.label("");
+            changed |= ui
+                .checkbox(&mut self.settings.guard_desktop_keys, t("settings.guard_keys"))
+                .on_hover_text(t("settings.guard_keys_hint"))
+                .changed();
+            ui.end_row();
+            ui.label(t("settings.mcp"));
+            ui.horizontal(|ui| {
+                changed |=
+                    ui.checkbox(&mut self.settings.mcp_enabled, t("settings.mcp_enabled")).on_hover_text(t("settings.mcp_hint")).changed();
+                ui.label(t("settings.port"));
+                let r = ui.add(egui::DragValue::new(&mut self.settings.mcp_port).range(1024..=65535));
+                if r.changed() {
+                    // a new port is tried again
+                    self.mcp_error = None;
+                    changed = true;
+                }
+            });
+            ui.end_row();
+            ui.label("");
+            ui.vertical(|ui| {
+                match (&self.mcp, &self.mcp_error) {
+                    (_, Some(e)) => {
+                        ui.colored_label(super::LIVE_COLOR, tf("settings.mcp_error", &[("err", e)]));
+                    }
+                    (Some(s), None) => {
+                        let url = format!("http://127.0.0.1:{}/mcp", s.port);
+                        ui.label(tf("settings.mcp_running", &[("url", &url)]));
+                        let cmd = format!("claude mcp add --transport http oh-presenter {url}");
+                        ui.horizontal(|ui| {
+                            ui.code(&cmd);
+                            if ui.small_button("📋").on_hover_text(t("settings.copy")).clicked() {
+                                ui.ctx().copy_text(cmd.clone());
+                            }
+                        });
+                    }
+                    (None, None) => {
+                        ui.weak(t("settings.mcp_off"));
+                    }
+                }
+                ui.weak(t("settings.mcp_cli_hint"));
+            });
+            ui.end_row();
+        });
         changed
     }
 

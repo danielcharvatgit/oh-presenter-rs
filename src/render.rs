@@ -91,6 +91,14 @@ pub fn to_screen(rect: Rect, p: Pos2) -> Pos2 {
     rect.min + p.to_vec2() * s
 }
 
+/// Whether the output window paints black behind `scene`. With a transparent output
+/// (`transparent`), a designed slide with a transparent background (a picture with an alpha
+/// channel) is not: what is behind the window (another program, a video player) shows
+/// through it, so the picture is an overlay.
+pub fn paints_black_behind(transparent: bool, scene: &Scene) -> bool {
+    !(transparent && matches!(scene, Scene::Canvas(doc) if doc.background.0[3] == 0))
+}
+
 /// Draws a scene as a still picture (previews): a video shows its poster.
 pub fn draw_scene(painter: &Painter, rect: Rect, scene: &Scene, tex: &mut TextureCache) {
     let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));

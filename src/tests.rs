@@ -2150,9 +2150,10 @@ fn ui_video_keys_on_the_service_tab() {
     h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "B".into(), text: "three".into() }));
     h.app.settings.live_follows_selection = false;
     h.frame(vec![]);
-    // nothing clicked yet: Space is the next slide
+    // no video selected or live: Space does nothing (it is no slide key since 0.2)
     h.press(Key::Space);
-    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    assert_eq!(h.app.sel_item, None);
+    assert!(h.app.live_pos.is_none());
     h.app.sel_item = Some(ItemRef::Service(1));
     h.app.sel_slide = 0;
     // a click in the item list (left): the selected video takes Space and the arrows
@@ -2200,19 +2201,23 @@ fn ui_video_keys_on_the_service_tab() {
     h.press(Key::Space);
     assert!(!live_video(&h.app).paused);
     assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
-    // leaving the tab forgets the click: Space is the next slide again
+    // leaving the tab forgets the click (← → are slide keys again)
     h.app.tab = crate::app::Tab::Songs;
     h.frame(vec![]);
     h.app.tab = crate::app::Tab::Service;
     assert_eq!(h.app.service_area, None);
-    // a selected text item in the list: Space / → are slide keys again
+    // a selected text item in the list: → is a slide key again
     h.frame(click_at(pos2(100.0, 450.0)));
     h.app.sel_item = Some(ItemRef::Service(0));
     h.app.sel_slide = 0;
     h.press(Key::ArrowRight);
     assert_eq!(h.app.sel_slide, 1);
+    // ...but Space is the live video's, whatever is selected: never the next item
+    let paused = live_video(&h.app).paused;
     h.press(Key::Space);
-    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    assert_eq!(h.app.sel_slide, 1);
+    assert_eq!(live_video(&h.app).paused, !paused);
     // the video keys are not slide-key conflicts in Settings
     let sc = &h.app.settings.shortcuts;
     let space = crate::shortcuts::KeyBinding::plain(Key::Space);
@@ -2295,4 +2300,886 @@ fn ui_service_tab_keys_work_with_a_focused_button() {
     h.ctx.memory_mut(|m| m.request_focus(eframe::egui::Id::unique("some_button")));
     assert_eq!(crate::shortcuts::KeyFocus::of(&h.ctx, false), crate::shortcuts::KeyFocus::Text);
     assert_eq!(crate::shortcuts::KeyFocus::of(&h.ctx, true), crate::shortcuts::KeyFocus::Widget);
+}
+
+// ---------------------------------------------------------------------------
+// 0.2.0: overlay pictures, video keys, F2, Esc, desktop guard, CLI, MCP
+
+/// A window tall enough to show the whole Settings tab.
+fn tall() -> eframe::egui::RawInput {
+    let size = eframe::egui::vec2(1400.0, 12000.0);
+    eframe::egui::RawInput { screen_rect: Some(eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, size)), ..Default::default() }
+}
+
+fn png_bytes(alpha: u8) -> Vec<u8> {
+    let mut img = image::RgbaImage::from_pixel(4, 3, image::Rgba([200, 10, 10, 255]));
+    img.put_pixel(0, 0, image::Rgba([0, 0, 0, alpha]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+    buf.into_inner()
+}
+
+#[test]
+fn transparent_pictures_are_overlays() {
+    use crate::render::paints_black_behind;
+    // a picture with transparent pixels: transparent background, its alpha kept
+    let d = formats::full_screen_image("logo", "logo.png".into(), &png_bytes(0));
+    assert_eq!(d.doc.background, Rgba::TRANSPARENT);
+    assert!(matches!(d.doc.objects[0].kind, ObjectKind::Image { opacity, .. } if opacity == 1.0));
+    // half transparent counts too; an opaque picture stays on black
+    assert_eq!(formats::full_screen_image("x", "x.png".into(), &png_bytes(128)).doc.background, Rgba::TRANSPARENT);
+    assert_eq!(formats::full_screen_image("x", "x.png".into(), &png_bytes(255)).doc.background, Rgba::BLACK);
+    // the output paints black behind everything except a see-through slide on a transparent output
+    let clear = Scene::Canvas(d.doc.clone());
+    assert!(!paints_black_behind(true, &clear));
+    assert!(paints_black_behind(false, &clear));
+    let black = Scene::Canvas(formats::full_screen_image("x", "x.png".into(), &png_bytes(255)).doc);
+    assert!(paints_black_behind(true, &black));
+    assert!(paints_black_behind(true, &Scene::Blank));
+    // the windows are created transparent only when asked for, also the --cli output
+    assert_eq!(crate::main_viewport(false, true).transparent, Some(true));
+    assert_eq!(crate::main_viewport(true, true).transparent, Some(true));
+    assert_eq!(crate::main_viewport(false, false).transparent, Some(false));
+}
+
+#[test]
+fn ui_transparent_output_clears_to_nothing() {
+    let mut h = Harness::new();
+    let visuals = eframe::egui::Visuals::dark();
+    assert_eq!(eframe::App::clear_color(&h.app, &visuals)[3], 1.0, "an ordinary program window is opaque");
+    assert_eq!(h.app.output_viewport("o").transparent, Some(false));
+    let settings =
+        crate::settings::Settings { network_enabled: false, language: "en".into(), output_transparent: true, ..Default::default() };
+    h.app = crate::app::App::with_settings(&h.ctx, settings);
+    assert_eq!(eframe::App::clear_color(&h.app, &visuals), [0.0; 4]);
+    assert_eq!(h.app.output_viewport("o").transparent, Some(true), "the output window itself is transparent too");
+    h.frame(vec![]);
+}
+
+#[test]
+fn space_is_no_slide_key_and_old_keys_are_upgraded() {
+    use crate::shortcuts::{Action, KeyBinding};
+    use eframe::egui::Key;
+    let d = crate::shortcuts::Shortcuts::default();
+    assert!(!d.bindings(Action::NextSlide).contains(&KeyBinding::plain(Key::Space)));
+    assert_eq!(d.bindings(Action::VideoPlayPause), vec![KeyBinding::plain(Key::Space)]);
+    assert_eq!(d.bindings(Action::RenameItem), vec![KeyBinding::plain(Key::F2)]);
+    // settings of 0.1.x: F8 freeze and Space as next slide become the new defaults
+    let mut s: crate::settings::Settings =
+        serde_json::from_str(r#"{"shortcuts":{"Freeze":["F8"],"NextSlide":["ArrowDown","PageDown","ArrowRight","Space"],"Blank":["B"]}}"#)
+            .unwrap();
+    s.upgrade_shortcuts();
+    assert_eq!(s.shortcuts.bindings(Action::Freeze), vec![KeyBinding::plain(Key::Comma)]);
+    assert_eq!(s.shortcuts.bindings(Action::NextSlide), Action::NextSlide.defaults());
+    // a key the user chose stays
+    assert_eq!(s.shortcuts.bindings(Action::Blank), vec![KeyBinding::plain(Key::B)]);
+    let mut own: crate::settings::Settings = serde_json::from_str(r#"{"shortcuts":{"Freeze":["F8","F9"],"NextSlide":["Space"]}}"#).unwrap();
+    own.upgrade_shortcuts();
+    assert_eq!(own.shortcuts.bindings(Action::Freeze).len(), 2);
+    assert_eq!(own.shortcuts.bindings(Action::NextSlide), vec![KeyBinding::plain(Key::Space)]);
+    // new actions get their keys
+    assert_eq!(own.shortcuts.bindings(Action::RenameItem), vec![KeyBinding::plain(Key::F2)]);
+}
+
+#[test]
+fn ui_space_on_a_focused_service_row_plays_the_video() {
+    use crate::app::ItemRef;
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "A".into(), text: "one\n---\ntwo".into() }));
+    h.app.service.items.push(sample_video(100.0));
+    h.app.settings.live_follows_selection = false;
+    h.frame(vec![]);
+    // a selected video that is not live: Space shows it live, playing (no click needed)
+    h.app.sel_item = Some(ItemRef::Service(1));
+    h.press(Key::Space);
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(1), 0)));
+    assert!(!live_video(&h.app).paused);
+    // the keyboard focus on a row of the item list (Tab): Space pauses / plays, the selection stays
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.frame(vec![]);
+    let row = h.app.service_row_id_for_test(0).expect("row id");
+    h.ctx.memory_mut(|m| m.request_focus(row));
+    h.frame(vec![]);
+    assert!(h.ctx.memory(|m| m.has_focus(row)));
+    h.press(Key::Space);
+    assert!(live_video(&h.app).paused, "Space on a focused row pauses the live video");
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    assert_eq!(h.app.sel_slide, 0);
+    h.press(Key::Space);
+    assert!(!live_video(&h.app).paused);
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)), "Space never moves to another item");
+}
+
+#[test]
+fn ui_f2_renames_the_selected_item() {
+    use crate::app::{Dialog, ItemRef};
+    use eframe::egui::{Key, Modifiers};
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "Announcements".into(), text: "x".into() }));
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.frame(vec![]);
+    h.press(Key::F2);
+    assert!(matches!(h.app.dialog, Some(Dialog::RenameItem(0))), "{:?}", h.app.dialog);
+    assert_eq!(h.app.rename_text, "Announcements");
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("service.rename")), "{:?}", h.texts);
+    // Esc cancels
+    h.press(Key::Escape);
+    assert!(h.app.dialog.is_none());
+    assert_eq!(h.app.service.items[0].title(), "Announcements");
+    assert!(!h.app.service_dirty);
+    // typed name + Enter
+    h.press(Key::F2);
+    h.frame(vec![]);
+    h.frame(key(Key::A, Modifiers::COMMAND));
+    let mut ev = vec![eframe::egui::Event::Text("Notices".into())];
+    ev.extend(key(Key::Enter, Modifiers::NONE));
+    h.frame(ev);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+    assert_eq!(h.app.service.items[0].title(), "Notices");
+    assert_eq!(h.app.service.items[0].own_title(), "Announcements");
+    assert!(h.app.service_dirty);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t.contains("Notices")), "the list shows the new name");
+    // the name is kept in the service file; old files without it load
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/renamed.ohsvc");
+    formats::save_service(&path, &h.app.service).unwrap();
+    assert_eq!(formats::load_service(&path).unwrap().items[0].title(), "Notices");
+    let _ = std::fs::remove_file(&path);
+    let old: ServiceItem = serde_json::from_str(r#"{"id":"x","kind":{"Text":{"title":"T","text":""}}}"#).unwrap();
+    assert_eq!(old.title(), "T");
+    // an empty name is the own title again
+    assert!(h.app.rename_item(0, "  "));
+    assert_eq!(h.app.service.items[0].title(), "Announcements");
+    assert!(h.app.service.items[0].name.is_empty());
+    // F2 without a selected item does nothing; the key is listed in Settings
+    h.app.sel_item = None;
+    h.press(Key::F2);
+    assert!(h.app.dialog.is_none());
+    h.app.tab = crate::app::Tab::Settings;
+    h.frame_with(tall());
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("action.RenameItem")));
+    assert!(h.texts.iter().any(|t| t.starts_with("F2")), "{:?}", h.texts.iter().filter(|t| t.contains('F')).collect::<Vec<_>>());
+}
+
+#[test]
+fn ui_shift_tab_moves_the_focus_back() {
+    use eframe::egui::{Key, Modifiers};
+    let mut h = Harness::new();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "A".into(), text: "one".into() }));
+    h.frame(vec![]);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        h.press(Key::Tab);
+        h.frame(vec![]);
+        seen.push(h.ctx.memory(|m| m.focused()).expect("focused"));
+    }
+    assert!(seen.windows(2).all(|w| w[0] != w[1]), "Tab moves on: {seen:?}");
+    h.frame(key(Key::Tab, Modifiers::SHIFT));
+    h.frame(vec![]);
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(seen[2]), "Shift+Tab goes back to the widget before");
+    h.frame(key(Key::Tab, Modifiers::SHIFT));
+    h.frame(vec![]);
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(seen[1]));
+}
+
+#[test]
+fn ui_esc_in_the_output_cancels_the_question_and_lost_fullscreen_comes_back() {
+    use crate::app::{Dialog, OutputChange};
+    let mut h = Harness::new();
+    h.app.output_open = true;
+    h.app.output_fullscreen = true;
+    h.app.set_screens(Some(0), Some(1));
+    h.frame(vec![]);
+    // the Esc key itself (the output window is drawn inside the main one without a native
+    // backend; the main window alone does nothing with Esc without a dialog): it asks first
+    h.press(eframe::egui::Key::Escape);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::LeaveOutput(OutputChange::Windowed))), "{:?}", h.app.dialog);
+    h.app.dialog = None;
+    h.frame(vec![]);
+    // Esc in the output asks first...
+    h.app.output_reports(Some(false), false);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::LeaveOutput(OutputChange::Windowed))));
+    // ...and Esc in the output again (it still has the keyboard) is Cancel
+    h.app.output_reports(Some(false), false);
+    h.frame(vec![]);
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+    assert!(h.app.output_fullscreen && h.app.output_open);
+    // an other dialog is not answered by it
+    h.app.dialog = Some(Dialog::Message("x".into()));
+    h.app.output_reports(Some(false), false);
+    h.frame(vec![]);
+    assert!(matches!(h.app.dialog, Some(Dialog::Message(_))));
+    h.app.dialog = None;
+    h.frame(vec![]);
+
+    // the desktop takes the output out of full screen: it is put back, with a warning
+    h.app.output_placing_done();
+    let lost = |h: &mut Harness| {
+        let mut input = eframe::egui::RawInput::default();
+        let v = input.viewports.entry(eframe::egui::ViewportId::ROOT).or_default();
+        v.fullscreen = Some(false);
+        h.frame_with(input);
+    };
+    lost(&mut h);
+    assert!(!h.app.output_placing(), "not at once (a short state while it is being placed)");
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    lost(&mut h);
+    assert!(h.app.output_placing(), "put back into full screen");
+    h.frame(vec![]);
+    let status = h.app.status.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
+    assert_eq!(status, crate::i18n::t("output.fullscreen_restored"));
+    // a windowed output (or one on the program's screen) is left alone
+    h.app.output_placing_done();
+    h.app.set_screens(Some(0), Some(0));
+    h.frame(vec![]);
+    lost(&mut h);
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    lost(&mut h);
+    assert!(!h.app.output_placing());
+}
+
+// the desktop guard's commands, recorded instead of run
+static GUARD_LOG: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());
+static GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn guard_run(cmd: &[String]) -> Option<String> {
+    GUARD_LOG.lock().unwrap().push(cmd.to_vec());
+    match cmd.get(1).map(String::as_str) {
+        Some("get") => Some("'Super_L'".into()),
+        _ if cmd[0] == "kreadconfig6" => Some(String::new()),
+        _ => Some(String::new()),
+    }
+}
+
+/// The desktop's value, as a desktop that turns the key off but then fails to put it back
+/// (dbus gone at logout, …).
+static GUARD_VALUE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn guard_fail_write(cmd: &[String]) -> Option<String> {
+    GUARD_LOG.lock().unwrap().push(cmd.to_vec());
+    let mut v = GUARD_VALUE.lock().unwrap();
+    match cmd.get(1).map(String::as_str) {
+        Some("get") => Some(v.clone()),
+        Some("set") if cmd.last().map(String::as_str) == Some("''") => {
+            *v = "''".into();
+            Some(String::new())
+        }
+        _ => None,
+    }
+}
+
+fn guard_fail_read(cmd: &[String]) -> Option<String> {
+    GUARD_LOG.lock().unwrap().push(cmd.to_vec());
+    None
+}
+
+#[test]
+fn desktop_guard_turns_keys_off_and_back_on() {
+    use crate::desktop_guard::{Desktop, Guard, settings_for};
+    let _l = GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    assert_eq!(Desktop::from_xdg("ubuntu:GNOME"), Desktop::Gnome);
+    assert_eq!(Desktop::from_xdg("GNOME"), Desktop::Gnome);
+    assert_eq!(Desktop::from_xdg("X-Cinnamon"), Desktop::Cinnamon);
+    assert_eq!(Desktop::from_xdg("KDE"), Desktop::Plasma);
+    assert_eq!(Desktop::from_xdg("Hyprland"), Desktop::Hyprland);
+    assert_eq!(Desktop::from_xdg("XFCE"), Desktop::Other);
+    assert_eq!(Desktop::from_xdg(""), Desktop::Other);
+    assert!(settings_for(Desktop::Hyprland).is_empty() && settings_for(Desktop::Other).is_empty());
+    assert_eq!(settings_for(Desktop::Cinnamon)[0].write_cmd("''"), ["gsettings", "set", "org.cinnamon.muffin", "overlay-key", "''"]);
+
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/guard-test.json");
+    let _ = std::fs::remove_file(&file);
+    GUARD_LOG.lock().unwrap().clear();
+    // GNOME: saved, turned off, put back
+    let mut g = Guard::new(Desktop::Gnome, guard_run, file.clone());
+    g.set(true);
+    assert!(g.engaged() && file.exists());
+    assert_eq!(
+        GUARD_LOG.lock().unwrap().clone(),
+        vec![
+            vec!["gsettings".to_string(), "get".into(), "org.gnome.mutter".into(), "overlay-key".into()],
+            vec!["gsettings".to_string(), "set".into(), "org.gnome.mutter".into(), "overlay-key".into(), "''".into()],
+        ]
+    );
+    GUARD_LOG.lock().unwrap().clear();
+    g.set(true);
+    assert!(GUARD_LOG.lock().unwrap().is_empty(), "engaged once");
+    g.set(false);
+    assert_eq!(
+        GUARD_LOG.lock().unwrap().clone(),
+        vec![vec!["gsettings".to_string(), "set".into(), "org.gnome.mutter".into(), "overlay-key".into(), "'Super_L'".into()]]
+    );
+    assert!(!file.exists());
+    // a crash while engaged: the next start puts it back
+    g.set(true);
+    std::mem::forget(g);
+    GUARD_LOG.lock().unwrap().clear();
+    let g2 = Guard::new(Desktop::Gnome, guard_run, file.clone());
+    assert_eq!(GUARD_LOG.lock().unwrap().last().unwrap().last().unwrap(), "'Super_L'");
+    assert!(!file.exists() && !g2.engaged());
+    drop(g2);
+    // Plasma: not set before -> removed again, kwin reloads
+    GUARD_LOG.lock().unwrap().clear();
+    let mut p = Guard::new(Desktop::Plasma, guard_run, file.clone());
+    p.set(true);
+    p.set(false);
+    let log = GUARD_LOG.lock().unwrap().clone();
+    assert_eq!(log[0][0], "kreadconfig6");
+    assert_eq!(log[1].last().unwrap(), "", "Meta set to nothing");
+    assert!(log[2].iter().any(|a| a == "org.kde.KWin.reconfigure"));
+    assert!(log[3].iter().any(|a| a == "--delete"), "{log:?}");
+    assert!(log[4].iter().any(|a| a == "org.kde.KWin.reconfigure"));
+    drop(p);
+    // a setting that cannot be read is never changed (it could not be put back)
+    GUARD_LOG.lock().unwrap().clear();
+    let mut f = Guard::new(Desktop::Gnome, guard_fail_read, file.clone());
+    f.set(true);
+    assert_eq!(GUARD_LOG.lock().unwrap().len(), 1, "only the read");
+    assert!(!file.exists());
+    f.set(false);
+    // putting back fails: the saved value is kept and put back by the next try, and a new
+    // engage never saves over it
+    *GUARD_VALUE.lock().unwrap() = "'Super_L'".into();
+    let mut w = Guard::new(Desktop::Gnome, guard_fail_write, file.clone());
+    w.set(true);
+    w.set(false);
+    assert!(file.exists(), "kept while not put back");
+    w.set(true);
+    w.set(false);
+    std::mem::forget(w);
+    let saved: crate::desktop_guard::Saved = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(saved.values, vec![Some("'Super_L'".to_string())], "the user's value, not ours");
+    GUARD_LOG.lock().unwrap().clear();
+    let ok = Guard::new(Desktop::Gnome, guard_run, file.clone());
+    assert!(!file.exists());
+    assert_eq!(GUARD_LOG.lock().unwrap().last().unwrap().last().unwrap(), "'Super_L'");
+    drop(ok);
+    // Hyprland: nothing is run
+    GUARD_LOG.lock().unwrap().clear();
+    let mut h = Guard::new(Desktop::Hyprland, guard_run, file.clone());
+    h.set(true);
+    h.set(false);
+    assert!(GUARD_LOG.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ui_desktop_guard_follows_the_output() {
+    // a crashed run left the desktop's keys off: the start puts them back
+    test_home();
+    let file = crate::storage::paths().config.join("desktop-guard.json");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, r#"{"desktop":"Gnome","values":["'Super_L'"],"changed":[true]}"#).unwrap();
+    let mut h = Harness::new();
+    assert!(!file.exists(), "put back at the start");
+    h.app.output_open = true;
+    h.app.output_fullscreen = true;
+    h.app.set_screens(Some(0), Some(1));
+    h.frame(vec![]);
+    assert!(h.app.desktop_guard_engaged(), "full screen on another screen");
+    let ctx = h.ctx.clone();
+    h.app.apply_output_change(crate::app::OutputChange::Windowed, &ctx);
+    h.frame(vec![]);
+    assert!(!h.app.desktop_guard_engaged());
+    h.app.output_fullscreen = true;
+    h.app.settings.guard_desktop_keys = false;
+    h.frame(vec![]);
+    assert!(!h.app.desktop_guard_engaged(), "off in the settings");
+}
+
+#[test]
+fn cli_options_and_help() {
+    use crate::cli::{Options, Parsed, parse};
+    let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    let Ok(Parsed::Run(o)) = parse(&a("--cli --service servicefile --service-item video.mp4 --playback-control=play-loop")) else {
+        panic!()
+    };
+    assert_eq!(
+        o,
+        Options {
+            cli: true,
+            service: Some("servicefile".into()),
+            service_item: Some("video.mp4".into()),
+            playback_control: Some("play-loop".into()),
+            ..Default::default()
+        }
+    );
+    let names: Vec<String> = o.startup_commands().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["open-service", "select-item", "go-live", "playback-control"]);
+    assert_eq!(parse(&a("--help")), Ok(Parsed::Help));
+    assert_eq!(parse(&a("-h")), Ok(Parsed::Help));
+    assert_eq!(parse(&a("--version")), Ok(Parsed::Version));
+    assert_eq!(parse(&[]), Ok(Parsed::Run(Options::default())));
+    assert!(parse(&a("--bogus")).is_err());
+    let Ok(Parsed::Run(o)) = parse(&a("sunday.ohsvc")) else { panic!() };
+    assert_eq!(o.service, Some("sunday.ohsvc".into()));
+    assert!(parse(&a("a.ohsvc b.ohsvc")).is_err(), "one service at a time");
+    assert!(parse(&a("--playback-control dance")).is_err());
+    assert!(parse(&a("--service")).is_err());
+    assert!(parse(&a("--slide 2")).is_err(), "needs --service-item");
+    assert!(parse(&a("--command nonsense")).is_err());
+    let Ok(Parsed::Run(o)) = parse(&a("--windowed --mcp-port 4000 --live-mode off --service-item 2 --slide 3")) else { panic!() };
+    assert!(o.windowed && o.mcp && o.mcp_port == Some(4000) && o.live_mode == Some(false) && o.slide == Some(3));
+    assert!(parse(&a("--mcp-port 0")).is_err());
+    let help = crate::cli::help();
+    assert!(help.contains("0.2.0"));
+    for opt in [
+        "--cli",
+        "--service",
+        "--service-item",
+        "--slide",
+        "--playback-control",
+        "--live-mode",
+        "--windowed",
+        "--command",
+        "--mcp",
+        "--mcp-port",
+        "--help",
+        "--version",
+    ] {
+        assert!(help.contains(opt), "{opt}");
+    }
+    for c in crate::remote::COMMANDS {
+        assert!(help.contains(c.name), "{}", c.name);
+    }
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+    let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md")).unwrap();
+    assert!(readme.contains("Current version: **0.2.0**"));
+}
+
+#[test]
+fn command_lines_are_parsed() {
+    use crate::remote::parse_line;
+    use serde_json::json;
+    let (n, a) = parse_line("select-item 3").unwrap();
+    assert_eq!((n.as_str(), a.get("item")), ("select-item", Some(&json!("3"))));
+    let (_, a) = parse_line("alert The owner of car 1AB 2345").unwrap();
+    assert_eq!(a["text"], json!("The owner of car 1AB 2345"));
+    let (_, a) = parse_line(r#"add-text "Good morning" Welcome everybody"#).unwrap();
+    assert_eq!((a["title"].clone(), a["text"].clone()), (json!("Good morning"), json!("Welcome everybody")));
+    let (_, a) = parse_line("playback-control seek seconds=90").unwrap();
+    assert_eq!(a["seconds"], json!(90.0));
+    let (_, a) = parse_line("playback-control seek 30.5").unwrap();
+    assert_eq!(a["seconds"], json!(30.5));
+    let (_, a) = parse_line("bible search John 3:16").unwrap();
+    assert_eq!(a["query"], json!("John 3:16"));
+    let (_, a) = parse_line("bible search bible=KJV John 3:16").unwrap();
+    assert_eq!((a["bible"].clone(), a["query"].clone()), (json!("KJV"), json!("John 3:16")));
+    let (_, a) = parse_line("open-service 'my file.ohsvc' true").unwrap();
+    assert_eq!((a["file"].clone(), a["discard"].clone()), (json!("my file.ohsvc"), json!(true)));
+    assert!(parse_line("select-slide two").is_err());
+    assert!(parse_line("blank maybe").is_err());
+    assert!(parse_line("select-item").is_err(), "a required argument");
+    assert!(parse_line("next-slide 1").is_err(), "too many");
+    assert!(parse_line("fly").is_err());
+    assert!(parse_line("alert \"open").is_err());
+    // the designer is not controlled from outside
+    assert!(crate::remote::COMMANDS.iter().all(|c| !c.name.contains("design") || c.name == "add-design" || c.name == "list-designs"));
+}
+
+/// Runs `line` as the command line / MCP would.
+fn cmd(h: &mut Harness, line: &str) -> Result<String, String> {
+    let (name, args) = crate::remote::parse_line(line)?;
+    let ctx = h.ctx.clone();
+    let out = h.app.run_command(&name, &args, &ctx);
+    h.frame(vec![]);
+    out
+}
+
+#[test]
+fn ui_every_command_works() {
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/commands");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut song = sample_song();
+    song.title = "Command song".into();
+    h.app.lib.songs.push(song);
+    h.app.lib.designs.push(formats::full_screen_image("Command design", "x.png".into(), &png_bytes(255)));
+    let mut done = std::collections::BTreeSet::new();
+    let mut run = |h: &mut Harness, line: &str| -> Result<String, String> {
+        done.insert(line.split_whitespace().next().unwrap().to_string());
+        cmd(h, line)
+    };
+    run(&mut h, "live-mode off").unwrap();
+    assert!(!h.app.settings.live_follows_selection);
+    run(&mut h, "new-service").unwrap();
+    run(&mut h, "add-text Welcome \"one\n---\ntwo\"").unwrap();
+    run(&mut h, "add-song command").unwrap();
+    assert!(run(&mut h, "add-song nothing-like-this").is_err());
+    run(&mut h, "add-design \"Command design\"").unwrap();
+    assert!(run(&mut h, "add-design nope").is_err());
+    let img = dir.join("over.png");
+    std::fs::write(&img, png_bytes(0)).unwrap();
+    run(&mut h, &format!("add-image '{}'", img.display())).unwrap();
+    assert!(run(&mut h, "add-image /no/such/picture.png").is_err());
+    assert!(run(&mut h, "add-video /no/such/video.mp4").is_err());
+    assert_eq!(h.app.service.items.len(), 4);
+    assert!(run(&mut h, "new-service").is_err(), "unsaved changes");
+    let list = run(&mut h, "list-items").unwrap();
+    assert!(list.contains("Welcome") && list.contains("Command song"), "{list}");
+    run(&mut h, "select-item Welcome").unwrap();
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(0)));
+    run(&mut h, "select-item 2").unwrap();
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    assert!(run(&mut h, "select-item 99").is_err());
+    let slides = run(&mut h, "list-slides").unwrap();
+    assert!(slides.lines().count() >= 6, "{slides}");
+    run(&mut h, "select-slide 2").unwrap();
+    assert_eq!(h.app.sel_slide, 1);
+    assert!(run(&mut h, "select-slide 99").is_err());
+    run(&mut h, "go-live").unwrap();
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(1), 1)));
+    run(&mut h, "next-slide").unwrap();
+    assert_eq!(h.app.sel_slide, 2);
+    run(&mut h, "prev-slide").unwrap();
+    assert_eq!(h.app.sel_slide, 1);
+    run(&mut h, "last-slide").unwrap();
+    run(&mut h, "first-slide").unwrap();
+    assert_eq!(h.app.sel_slide, 0);
+    run(&mut h, "next-item").unwrap();
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(2)));
+    run(&mut h, "prev-item").unwrap();
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    run(&mut h, "rename-item Opening song").unwrap();
+    assert_eq!(h.app.service.items[1].title(), "Opening song");
+    run(&mut h, "select-item opening").unwrap();
+    run(&mut h, "move-up").unwrap();
+    assert_eq!(h.app.service.items[0].title(), "Opening song");
+    run(&mut h, "move-down").unwrap();
+    run(&mut h, "duplicate-item").unwrap();
+    assert_eq!(h.app.service.items.len(), 5);
+    run(&mut h, "remove-item").unwrap();
+    assert_eq!(h.app.service.items.len(), 4);
+    run(&mut h, "blank on").unwrap();
+    assert!(h.app.blank);
+    run(&mut h, "blank on").unwrap();
+    assert!(h.app.blank, "on stays on");
+    run(&mut h, "blank").unwrap();
+    assert!(!h.app.blank, "toggle");
+    run(&mut h, "freeze on").unwrap();
+    assert!(h.app.frozen.is_some());
+    run(&mut h, "freeze off").unwrap();
+    assert!(h.app.frozen.is_none());
+    assert!(run(&mut h, "playback-control play").is_err(), "no video");
+    run(&mut h, "output open").unwrap();
+    assert!(h.app.output_open);
+    run(&mut h, "output fullscreen").unwrap();
+    assert!(h.app.output_fullscreen);
+    run(&mut h, "output windowed").unwrap();
+    assert!(!h.app.output_fullscreen && h.app.output_open);
+    run(&mut h, "output close").unwrap();
+    assert!(!h.app.output_open);
+    run(&mut h, "alert Hello there").unwrap();
+    assert_eq!(h.app.alert.as_ref().map(|(a, _)| a.text.as_str()), Some("Hello there"));
+    run(&mut h, "stop-alert").unwrap();
+    assert!(h.app.alert.is_none());
+    run(&mut h, "show-tab songs").unwrap();
+    assert_eq!(h.app.tab, crate::app::Tab::Songs);
+    run(&mut h, "show-tab service").unwrap();
+    assert!(run(&mut h, "list-songs comm").unwrap().contains("Command song"));
+    assert!(run(&mut h, "list-designs").unwrap().contains("Command design"));
+    run(&mut h, "list-bibles").unwrap();
+    // a bible
+    let b = test_bible("CmdBible", &["In the beginning God created the heaven and the earth.", "And the earth was without form."]);
+    let bid = b.meta.id.clone();
+    h.app.bible.bibles.push(b.meta.clone());
+    h.app.bible.current = Some(b);
+    let found = run(&mut h, "bible search Genesis 1:1").unwrap();
+    assert!(found.contains("In the beginning"), "{found}");
+    run(&mut h, "bible show").unwrap();
+    assert_eq!(h.app.live_pos.map(|(r, _)| r), Some(ItemRef::Quick));
+    let n = h.app.service.items.len();
+    run(&mut h, &format!("bible add bible={bid} Genesis 1:2")).unwrap();
+    assert_eq!(h.app.service.items.len(), n + 1);
+    assert!(run(&mut h, "bible search bible=nosuchbible x").is_err());
+    let status = run(&mut h, "status").unwrap();
+    assert!(status.contains("live:") && status.contains("output window: closed"), "{status}");
+    let settings = run(&mut h, "get-settings").unwrap();
+    assert!(settings.contains("\"mcp_port\""));
+    run(&mut h, "set-setting verses_per_slide 3").unwrap();
+    assert_eq!(h.app.settings.verses_per_slide, 3);
+    run(&mut h, "set-setting clock.show true").unwrap();
+    assert!(h.app.settings.clock.show);
+    run(&mut h, "set-setting language '\"cs\"'").unwrap();
+    assert_eq!(crate::i18n::current_language(), "cs");
+    run(&mut h, "set-setting language '\"en\"'").unwrap();
+    assert!(run(&mut h, "set-setting nonsense 1").is_err());
+    assert!(run(&mut h, "set-setting verses_per_slide '\"many\"'").is_err());
+    assert_eq!(h.app.settings.verses_per_slide, 3, "a bad value changes nothing");
+    // save, open again
+    let file = dir.join("cmd.ohsvc");
+    assert!(run(&mut h, "save-service").is_err(), "a new service needs a file name");
+    run(&mut h, &format!("save-service-as '{}'", file.display())).unwrap();
+    assert!(file.exists() && !h.app.service_dirty);
+    assert!(run(&mut h, &format!("save-service-as '{}'", file.display())).is_ok(), "its own file");
+    run(&mut h, "add-text Extra").unwrap();
+    run(&mut h, "save-service").unwrap();
+    assert!(!h.app.service_dirty);
+    run(&mut h, "new-service").unwrap();
+    assert!(h.app.service.items.is_empty());
+    run(&mut h, &format!("open-service '{}'", file.display())).unwrap();
+    assert_eq!(h.app.service.items.len(), 6);
+    assert!(run(&mut h, "open-service /no/such.ohsvc").is_err());
+    run(&mut h, "add-text More").unwrap();
+    assert!(run(&mut h, &format!("open-service '{}'", file.display())).is_err(), "unsaved");
+    run(&mut h, &format!("open-service '{}' discard=true", file.display())).unwrap();
+    run(&mut h, "new-service discard=true").unwrap();
+    run(&mut h, &format!("save-service-as '{}'", dir.join("over.png").display())).unwrap();
+    assert!(dir.join("over.ohsvc").exists(), "saved as .ohsvc");
+    // every command was run here, or in the video test below
+    for c in crate::remote::COMMANDS {
+        assert!(done.contains(c.name) || ["playback-control", "add-video"].contains(&c.name), "{} untested", c.name);
+    }
+    assert!(h.app.run_command("fly", &Default::default(), &h.ctx.clone()).is_err());
+    // a question open for the operator: commands that change things wait for it; an error
+    // message the operator has open is not taken for a command's error
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "Q".into(), text: String::new() }));
+    h.app.sel_item = Some(ItemRef::Service(0));
+    h.app.open_rename_dialog();
+    assert!(cmd(&mut h, "remove-item").unwrap_err().contains("dialog"));
+    assert_eq!(h.app.service.items.len(), 1);
+    assert!(cmd(&mut h, "status").is_ok());
+    h.app.dialog = Some(crate::app::Dialog::Message("the operator's".into()));
+    assert!(cmd(&mut h, "list-items").is_ok());
+    assert!(matches!(h.app.dialog, Some(crate::app::Dialog::Message(_))));
+    h.app.dialog = None;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ui_cli_plan_plays_the_video_looped() {
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/cli-plan");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("service.ohsvc");
+    let mut video = sample_video(120.0);
+    if let ItemKind::Video(v) = &mut video.kind {
+        v.title = "video".into();
+        v.media = "video.mp4".into();
+    }
+    let service = Service { items: vec![ServiceItem::new(ItemKind::Text { title: "Welcome".into(), text: "hi".into() }), video] };
+    formats::save_service(&file, &service).unwrap();
+    let args: Vec<String> = ["--cli", "--service", &file.to_string_lossy(), "--service-item", "video.mp4", "--playback-control=play-loop"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let Ok(crate::cli::Parsed::Run(o)) = crate::cli::parse(&args) else { panic!() };
+    h.app.cli = true;
+    h.app.output_open = true;
+    h.app.startup_commands = o.startup_commands();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.app.startup_commands.is_empty());
+    assert_eq!(h.app.sel_item, Some(ItemRef::Service(1)));
+    assert_eq!(h.app.live_pos, Some((ItemRef::Service(1), 0)));
+    let v = live_video(&h.app);
+    assert!(v.looped && !v.paused, "{v:?}");
+    // the item's Loop switch follows
+    assert!(matches!(&h.app.service.items[1].kind, ItemKind::Video(v) if v.looped));
+    // --cli shows only the output: no menus, no tabs
+    assert!(!h.texts.iter().any(|t| t == &crate::i18n::t("menu.file") || t == &crate::i18n::t("tab.service")), "{:?}", h.texts);
+    // the other playback controls
+    for (line, check) in [
+        ("playback-control pause", (|v: &VideoScene| v.paused) as fn(&VideoScene) -> bool),
+        ("playback-control play-pause", |v| !v.paused),
+        ("playback-control seek seconds=60", |v| (60.0..61.0).contains(&v.position)),
+        ("playback-control forward", |v| (65.0..66.0).contains(&v.position)),
+        ("playback-control back", |v| (60.0..61.0).contains(&v.position)),
+        ("playback-control restart", |v| v.position < 1.0),
+        ("playback-control mute", |v| v.muted),
+        ("playback-control unmute", |v| !v.muted),
+        ("playback-control play-once", |v| !v.looped && !v.paused),
+        ("playback-control seek seconds=9999", |v| v.position == 120.0),
+        ("playback-control play", |v| v.position < 1.0 && !v.paused),
+    ] {
+        cmd(&mut h, line).unwrap();
+        let v = live_video(&h.app);
+        assert!(check(&v), "{line}: {v:?}");
+    }
+    assert!(cmd(&mut h, "playback-control seek").is_err(), "seek needs seconds");
+    // closing the --cli window ends the program, without asking
+    let mut input = eframe::egui::RawInput::default();
+    input.viewports.entry(eframe::egui::ViewportId::ROOT).or_default().events.push(eframe::egui::ViewportEvent::Close);
+    h.frame_with(input);
+    assert!(h.app.quit_confirmed);
+    assert!(h.app.dialog.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ui_commands_from_another_thread() {
+    let mut h = Harness::new();
+    let sender = h.app.remote_sender(&h.ctx);
+    let t = std::thread::spawn(move || {
+        let a = sender.call(
+            "add-text",
+            serde_json::json!({"title": "From afar"}).as_object().unwrap().clone(),
+            std::time::Duration::from_secs(10),
+        );
+        let b =
+            sender.call("select-item", serde_json::json!({"item": 42}).as_object().unwrap().clone(), std::time::Duration::from_secs(10));
+        (a, b)
+    });
+    while !t.is_finished() {
+        h.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let (a, b) = t.join().unwrap();
+    assert!(a.is_ok(), "{a:?}");
+    assert!(b.unwrap_err().contains("wrong value"), "a number where a text is expected");
+    assert_eq!(h.app.service.items[0].title(), "From afar");
+    // nobody waits for it any more: it is not done late
+    let late = h.app.remote_sender(&h.ctx).call(
+        "add-text",
+        serde_json::json!({"title": "Too late"}).as_object().unwrap().clone(),
+        std::time::Duration::from_millis(1),
+    );
+    assert!(late.is_err());
+    h.frame(vec![]);
+    assert_eq!(h.app.service.items.len(), 1);
+}
+
+/// One HTTP request to the MCP server; (status, body).
+fn http(port: u16, method: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    let mut req = format!(
+        "{method} /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    let status = out.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn mcp_requests_from_other_sites_are_refused() {
+    use crate::remote::mcp::{HttpRequest, allowed};
+    let req = |headers: &[(&str, &str)]| HttpRequest {
+        method: "POST".into(),
+        path: "/mcp".into(),
+        headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        body: Vec::new(),
+    };
+    assert!(allowed(&req(&[("Host", "127.0.0.1:7779")])));
+    assert!(allowed(&req(&[("Host", "localhost:7779"), ("Origin", "http://localhost:3000")])));
+    assert!(allowed(&req(&[("Host", "[::1]:7779")])));
+    assert!(allowed(&req(&[])));
+    assert!(!allowed(&req(&[("Host", "127.0.0.1:7779"), ("Origin", "https://evil.example")])));
+    assert!(!allowed(&req(&[("Host", "127.0.0.1:7779"), ("Origin", "http://localhost.evil.example")])));
+    assert!(!allowed(&req(&[("Host", "rebind.evil.example:7779")])));
+    assert!(!allowed(&req(&[("Origin", "null")])));
+    // the tools: every command, with a schema, none of the designer
+    let tools = crate::remote::mcp::tools();
+    assert_eq!(tools.len(), crate::remote::COMMANDS.len());
+    for t in &tools {
+        assert_eq!(t["inputSchema"]["type"], "object");
+        assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+}
+
+#[test]
+fn ui_mcp_server_answers_like_the_buttons() {
+    let mut h = Harness::new();
+    let port = 47791;
+    h.app.settings.mcp_port = port;
+    h.app.settings.mcp_enabled = true;
+    h.frame(vec![]);
+    assert_eq!(h.app.mcp_port(), Some(port), "{:?}", h.app.mcp_error);
+    // the agent's requests, while the UI runs
+    let t = std::thread::spawn(move || {
+        let init = http(
+            port,
+            "POST",
+            &[],
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        );
+        let note = http(port, "POST", &[], r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        let list = http(port, "POST", &[], r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+        let call = http(
+            port,
+            "POST",
+            &[],
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add-text","arguments":{"title":"Agent text","text":"a\n---\nb"}}}"#,
+        );
+        let bad = http(
+            port,
+            "POST",
+            &[],
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"select-slide","arguments":{"slide":"x"}}}"#,
+        );
+        let unknown =
+            http(port, "POST", &[], r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"designer-move","arguments":{}}}"#);
+        let method = http(port, "POST", &[], r#"{"jsonrpc":"2.0","id":6,"method":"resources/list"}"#);
+        let ping = http(port, "POST", &[], r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#);
+        let evil = http(port, "POST", &[("Origin", "https://evil.example")], r#"{"jsonrpc":"2.0","id":8,"method":"ping"}"#);
+        let get = http(port, "GET", &[], "");
+        let junk = http(port, "POST", &[], "{not json");
+        let status = http(port, "POST", &[], r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"status","arguments":{}}}"#);
+        [init, note, list, call, bad, unknown, method, ping, evil, get, junk, status]
+    });
+    while !t.is_finished() {
+        h.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let [init, note, list, call, bad, unknown, method, ping, evil, get, junk, status] = t.join().unwrap();
+    let json = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap();
+    assert_eq!(init.0, 200);
+    let init = json(&init.1);
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.2.0");
+    assert!(init["result"]["capabilities"]["tools"].is_object());
+    assert_eq!(note.0, 202);
+    let list = json(&list.1);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), crate::remote::COMMANDS.len());
+    let call = json(&call.1);
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    assert_eq!(h.app.service.items.last().map(|i| i.title()), Some("Agent text".into()));
+    let bad = json(&bad.1);
+    assert_eq!(bad["result"]["isError"], true);
+    assert_eq!(json(&unknown.1)["error"]["code"], -32602);
+    assert_eq!(json(&method.1)["error"]["code"], -32601);
+    assert_eq!(json(&ping.1)["result"], serde_json::json!({}));
+    assert_eq!(evil.0, 403);
+    assert_eq!(get.0, 405);
+    assert_eq!(junk.0, 400);
+    assert!(json(&status.1)["result"]["content"][0]["text"].as_str().unwrap().contains("1 items"));
+    // a port below 1024 is refused, not retried on every frame
+    h.app.settings.mcp_port = 0;
+    h.frame(vec![]);
+    assert_eq!(h.app.mcp_port(), None);
+    assert!(h.app.mcp_error.as_deref().unwrap_or_default().contains("1024"));
+    h.app.settings.mcp_port = port;
+    h.app.mcp_error = None;
+    h.frame(vec![]);
+    assert_eq!(h.app.mcp_port(), Some(port));
+    // off: the port is free again
+    h.app.settings.mcp_enabled = false;
+    h.frame(vec![]);
+    assert_eq!(h.app.mcp_port(), None);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "the server is stopped");
+    // the Advanced section shows the MCP switch
+    h.app.tab = crate::app::Tab::Settings;
+    h.frame_with(tall());
+    h.frame_with(tall());
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("settings.mcp_enabled")));
+    assert!(h.texts.iter().any(|t| t == &crate::i18n::t("settings.advanced")));
 }

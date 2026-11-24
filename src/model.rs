@@ -433,14 +433,23 @@ pub struct ServiceItem {
     pub kind: ItemKind,
     #[serde(default)]
     pub notes: String,
+    /// The name shown for this item in the service (F2 / Rename); empty = its own title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl ServiceItem {
     pub fn new(kind: ItemKind) -> Self {
-        Self { id: make_id(), kind, notes: String::new() }
+        Self { id: make_id(), kind, notes: String::new(), name: String::new() }
     }
 
+    /// The title shown in the service: the name it was renamed to, else its own title.
     pub fn title(&self) -> String {
+        if self.name.trim().is_empty() { self.own_title() } else { self.name.clone() }
+    }
+
+    /// The title of what the item holds (song title, design name, ...).
+    pub fn own_title(&self) -> String {
         match &self.kind {
             ItemKind::Song(s) => s.title.clone(),
             ItemKind::Design(d) => d.name.clone(),
