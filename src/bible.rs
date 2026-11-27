@@ -147,6 +147,59 @@ fn book_number_from_osis(osis: &str) -> Option<u32> {
     BOOKS.iter().position(|b| b.osis.eq_ignore_ascii_case(osis)).map(|i| i as u32 + 1)
 }
 
+/// Old or New Testament (or both): a filter of the word search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Testament {
+    #[default]
+    All,
+    Old,
+    New,
+}
+
+impl Testament {
+    /// Whether canonical book `number` belongs here (books after Revelation, as the
+    /// deuterocanonical books of some bibles, count as the Old Testament).
+    pub fn contains(self, number: u32) -> bool {
+        let new = (40..=66).contains(&number);
+        match self {
+            Testament::All => true,
+            Testament::Old => !new,
+            Testament::New => new,
+        }
+    }
+
+    /// `all`, `old` / `ot`, `new` / `nt`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "all" => Some(Testament::All),
+            "old" | "ot" => Some(Testament::Old),
+            "new" | "nt" => Some(Testament::New),
+            _ => None,
+        }
+    }
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Testament::All => "bible.testament_all",
+            Testament::Old => "bible.testament_old",
+            Testament::New => "bible.testament_new",
+        }
+    }
+}
+
+/// What the word search keeps: a testament and / or one book (canonical number).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchFilter {
+    pub testament: Testament,
+    pub book: Option<u32>,
+}
+
+impl SearchFilter {
+    pub fn accepts(&self, book_number: u32) -> bool {
+        self.testament.contains(book_number) && self.book.is_none_or(|b| b == book_number)
+    }
+}
+
 /// Book name in the UI language for canonical book `number`.
 pub fn book_display_name(number: u32, lang: &str) -> Option<&'static str> {
     let b = BOOKS.get(number.checked_sub(1)? as usize)?;
@@ -603,7 +656,14 @@ impl SearchIndex {
 
     /// Verses that contain every word of the query. A query word also matches inside a
     /// longer word (`milova` finds `zamilovaný`), case and diacritics are ignored.
+    #[cfg(test)]
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
+        self.search_where(query, limit, |_| true)
+    }
+
+    /// [`SearchIndex::search`], only verses `accept` lets through (filtered before the
+    /// `limit`, so a filter never hides verses behind the cap).
+    pub fn search_where(&self, query: &str, limit: usize, accept: impl Fn(&Hit) -> bool) -> Vec<Hit> {
         let mut result: Option<Vec<u32>> = None;
         for q in words(query) {
             // all verses with any indexed word containing q
@@ -624,7 +684,14 @@ impl SearchIndex {
                 break;
             }
         }
-        result.unwrap_or_default().into_iter().take(limit).filter_map(|n| self.hits.get(n as usize).cloned()).collect()
+        result
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|n| self.hits.get(n as usize))
+            .filter(|h| accept(h))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 }
 
@@ -679,23 +746,31 @@ fn clean(s: &str) -> String {
 /// Imports a bible file, detecting the format. `name` overrides the bible's own name.
 pub fn import_file(path: &Path) -> Result<Bible, String> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    #[cfg(feature = "sqlite")]
     if ext == "sqlite" || ext == "db" {
         return import_openlp_sqlite(path);
     }
-    if ext == "txt" {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        return Ok(import_txt(&String::from_utf8_lossy(&bytes), &stem));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
-    let doc = roxmltree::Document::parse_with_options(&text, opts).map_err(|e| e.to_string())?;
-    let root = doc.root_element();
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    import_bytes(&bytes, &stem, ext == "txt")
+}
+
+/// Imports a bible from the bytes of a file (Zefania, OSIS, OpenSong XML; `txt`: plain
+/// text). `stem` is the file name without its extension (the name when the file has none).
+/// The web edition, which has no files, imports with this.
+pub fn import_bytes(bytes: &[u8], stem: &str, txt: bool) -> Result<Bible, String> {
+    if txt {
+        return Ok(import_txt(&String::from_utf8_lossy(bytes), stem));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
+    let doc = roxmltree::Document::parse_with_options(text, opts).map_err(|e| e.to_string())?;
+    let root = doc.root_element();
     match root.tag_name().name() {
-        "XMLBIBLE" => Ok(import_zefania(root, &stem)),
-        "osis" => Ok(import_osis(root, &stem)),
-        "bible" => Ok(import_opensong(root, &stem)),
+        "XMLBIBLE" => Ok(import_zefania(root, stem)),
+        "osis" => Ok(import_osis(root, stem)),
+        "bible" => Ok(import_opensong(root, stem)),
         other => Err(format!("unknown bible format <{other}>")),
     }
 }
@@ -886,7 +961,9 @@ fn import_osis(root: roxmltree::Node, stem: &str) -> Bible {
     Bible::new(meta, st.books)
 }
 
-/// Imports a bible from an OpenLP bible database (`*.sqlite`).
+/// Imports a bible from an OpenLP bible database (`*.sqlite`). Not in the web edition (it
+/// shares this file and has no SQLite).
+#[cfg(feature = "sqlite")]
 pub fn import_openlp_sqlite(path: &Path) -> Result<Bible, String> {
     let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
     let meta_value = |key: &str| -> String {

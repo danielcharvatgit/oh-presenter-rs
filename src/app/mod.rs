@@ -1,11 +1,13 @@
 //! The presenter application (control window + output window).
 
 mod alerts;
+pub(crate) mod backgrounds;
 mod bible_index;
+pub(crate) mod bible_item;
 mod bible_tab;
 mod designer_tab;
 pub(crate) mod files;
-mod keynav;
+pub(crate) mod keynav;
 mod legacy;
 mod remote_cmd;
 mod service_tab;
@@ -32,10 +34,20 @@ use std::time::{Instant, SystemTime};
 pub enum Tab {
     Service,
     Songs,
-    Designer,
     Bible,
+    Designer,
     Settings,
 }
+
+/// The tabs of the top bar in the order shown, with their label and their shortcut. After
+/// the File and Output menus they are the 3rd to 7th item of the bar (`Alt+3` … `Alt+7`).
+pub const TABS: [(Tab, &str, Action); 5] = [
+    (Tab::Service, "tab.service", Action::TabService),
+    (Tab::Songs, "tab.songs", Action::TabSongs),
+    (Tab::Bible, "tab.bible", Action::TabBible),
+    (Tab::Designer, "tab.designer", Action::TabDesigner),
+    (Tab::Settings, "tab.settings", Action::TabSettings),
+];
 
 /// Which item the presenter cursor is on: a service item, or the quick
 /// (not yet added) bible passage.
@@ -168,6 +180,10 @@ pub struct BibleUi {
     pub languages_filled: bool,
     /// The word query is also a book name: offer to open that book.
     pub book_hint: Option<usize>,
+    /// Word search only in this testament / book.
+    pub filter: crate::bible::SearchFilter,
+    /// The last search was a word search (a changed filter runs it again).
+    pub word_search: bool,
 }
 
 pub struct DesignerState {
@@ -224,6 +240,9 @@ pub struct OutputShared {
     /// (again now and then: a closed and reopened output window is a new window).
     peek_marked: Option<Instant>,
     shortcuts: shortcuts::Shortcuts,
+    /// The actions the main window acts on now: their keys pressed in the output window are
+    /// sent to the main window (as if it had the keyboard).
+    enabled: Vec<Action>,
     mark_keys: MarkKeys,
     /// The screen the output goes on (its index for egui and the screen itself).
     target: Option<(usize, crate::screens::Monitor)>,
@@ -293,6 +312,10 @@ pub struct App {
     pub songs: SongEditor,
     pub designer: DesignerState,
     pub bible: BibleUi,
+    /// Bibles loaded for the service's passages (by id).
+    pub bible_cache: std::collections::HashMap<String, std::sync::Arc<Bible>>,
+    /// The bible controls of the selected service item (see [`bible_item`]).
+    pub bible_nav: bible_item::BibleNav,
 
     pub output_open: bool,
     pub output_fullscreen: bool,
@@ -351,6 +374,8 @@ pub struct App {
     pub mcp_forced: bool,
     /// Keeps the desktop's keys off the projector while presenting (created when needed).
     desktop_guard: Option<crate::desktop_guard::Guard>,
+    /// Keeps the computer from sleeping / locking (setting `prevent_sleep`).
+    awake: Option<crate::awake::Inhibitor>,
     /// The windows were created transparent (setting `output_transparent` at the start).
     transparent_windows: bool,
     /// For the threads that send commands (they wake the UI up).
@@ -428,6 +453,8 @@ impl App {
             offer_index: None,
             languages_filled: false,
             book_hint: None,
+            filter: Default::default(),
+            word_search: false,
         };
         let design = Design { id: make_id(), name: t("designer.untitled"), doc: CanvasDoc::default() };
         let mut app = Self {
@@ -466,6 +493,8 @@ impl App {
                 search: String::new(),
             },
             bible,
+            bible_cache: Default::default(),
+            bible_nav: Default::default(),
             output_open: false,
             output_fullscreen: false,
             server,
@@ -501,6 +530,7 @@ impl App {
             mcp_forced: false,
             // made at the start: it puts back desktop settings a crashed run left changed
             desktop_guard: Some(crate::desktop_guard::Guard::for_this_computer()),
+            awake: None,
             transparent_windows: settings.output_transparent,
             remote_ctx: Some(ctx.clone()),
             startup_commands: Vec::new(),
@@ -521,6 +551,7 @@ impl App {
                 hide_cursor: false,
                 peek_marked: None,
                 shortcuts: settings.shortcuts.clone(),
+                enabled: Vec::new(),
                 mark_keys: MarkKeys::default(),
                 actions: Vec::new(),
                 jump: None,
@@ -592,9 +623,60 @@ impl App {
         self.settings.text_background_design.as_ref().and_then(|id| self.lib.design(id)).map(|d| d.doc.clone())
     }
 
+    /// What is drawn behind the text slides of `item`: its own picture, else the service's
+    /// picture, else the design chosen in the settings.
+    pub(crate) fn text_background_of(&self, item: &ServiceItem) -> Option<CanvasDoc> {
+        match item.background.as_ref().or(self.service.background.as_ref()) {
+            Some(pic) => Some(CanvasDoc { background: self.settings.text_style.background, objects: vec![pic.object()] }),
+            None => self.text_background(),
+        }
+    }
+
+    /// The text slide of bible verses (one slide's worth) of passage `p`: the main
+    /// translation's text, the further translations one below it, the reference under them.
+    pub fn bible_scene(&self, p: &Passage, chunk: &[PassageVerse], background: Option<CanvasDoc>) -> Scene {
+        let text_of = |get: &dyn Fn(&PassageVerse) -> Option<String>| -> String {
+            if chunk.len() == 1 {
+                get(&chunk[0]).unwrap_or_default()
+            } else {
+                chunk
+                    .iter()
+                    .filter_map(|v| get(v).map(|t| if v.verse > 0 { format!("{} {}", v.verse, t) } else { t }))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        let text = text_of(&|v: &PassageVerse| Some(v.text.clone()));
+        let extra: Vec<String> = (0..p.extra_bibles.len()).map(|k| text_of(&|v: &PassageVerse| v.extra.get(k).cloned())).collect();
+        // the reference has its own option (songs and texts: text_style.show_footer)
+        let style = TextStyle { show_footer: self.settings.show_bible_reference, ..self.settings.text_style.clone() };
+        Scene::Text(TextScene { text, extra, layout: ColumnLayout::Stacked, footer: self.bible_footer(p, chunk), style, background })
+    }
+
+    /// The reference under bible verses, with the parts chosen in the settings.
+    pub fn bible_footer(&self, p: &Passage, chunk: &[PassageVerse]) -> String {
+        let parts = self.settings.bible_reference;
+        let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else { return String::new() };
+        let lang = crate::i18n::current_language();
+        let sep = if lang == "cs" { "," } else { ":" };
+        let reference = if first.verse == 0 {
+            // older files and OpenLP services: no verse numbers, the passage's own reference
+            if parts.book || parts.chapter || parts.verse { p.reference.clone() } else { String::new() }
+        } else {
+            verse_reference(&first.book, (first.chapter, first.verse), (last.chapter, last.verse), &parts, sep)
+        };
+        let versions: Vec<&str> =
+            std::iter::once(p.version.as_str()).chain(p.extra_versions.iter().map(String::as_str)).filter(|v| !v.is_empty()).collect();
+        match (parts.translation && !versions.is_empty(), reference.is_empty()) {
+            (true, true) => versions.join(" / "),
+            (true, false) => format!("{reference} ({})", versions.join(" / ")),
+            (false, _) => reference,
+        }
+    }
+
     pub fn item_slides(&self, item: &ServiceItem) -> Vec<Slide> {
         let style = self.settings.text_style.clone();
-        let background = self.text_background();
+        let background = self.text_background_of(item);
         let columns_scene = |mut texts: Vec<String>, footer: String, layout: ColumnLayout| {
             let text = if texts.is_empty() { String::new() } else { texts.remove(0) };
             Scene::Text(TextScene { text, extra: texts, layout, footer, style: style.clone(), background: background.clone() })
@@ -619,7 +701,17 @@ impl App {
                 }
                 out
             }
-            ItemKind::Design(d) => vec![Slide { label: d.name.clone(), tag: None, number: 0, scene: Scene::Canvas(d.doc.clone()) }],
+            ItemKind::Design(d) => {
+                let mut doc = d.doc.clone();
+                // a picture with transparent parts: the item's background picture shows through
+                // (the service's picture does not: such a picture is an overlay)
+                if let Some(pic) = &item.background
+                    && doc.background.0[3] == 0
+                {
+                    doc.objects.insert(0, pic.object());
+                }
+                vec![Slide { label: d.name.clone(), tag: None, number: 0, scene: Scene::Canvas(doc) }]
+            }
             ItemKind::Bible(p) => {
                 let per = self.settings.verses_per_slide.max(1);
                 let lang = crate::i18n::current_language();
@@ -628,33 +720,11 @@ impl App {
                     .chunks(per)
                     .map(|chunk| {
                         let first = &chunk[0];
-                        let last = chunk.last().unwrap();
-                        let text = if chunk.len() == 1 {
-                            first.text.clone()
-                        } else {
-                            chunk
-                                .iter()
-                                .map(|v| if v.verse > 0 { format!("{} {}", v.verse, v.text) } else { v.text.clone() })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        };
-                        let reference = if first.verse == 0 {
-                            p.reference.clone()
-                        } else if chunk.len() == 1 || first.chapter != last.chapter {
-                            if chunk.len() == 1 {
-                                format!("{} {}{}{}", first.book, first.chapter, sep, first.verse)
-                            } else {
-                                format!("{} {}{}{}-{}{}{}", first.book, first.chapter, sep, first.verse, last.chapter, sep, last.verse)
-                            }
-                        } else {
-                            format!("{} {}{}{}-{}", first.book, first.chapter, sep, first.verse, last.verse)
-                        };
-                        let footer = if p.version.is_empty() { reference.clone() } else { format!("{reference} ({})", p.version) };
                         Slide {
                             label: if first.verse > 0 { format!("{}{}{}", first.chapter, sep, first.verse) } else { String::new() },
                             tag: None,
                             number: first.verse,
-                            scene: text_scene(text, footer),
+                            scene: self.bible_scene(p, chunk, background.clone()),
                         }
                     })
                     .collect()
@@ -690,6 +760,9 @@ impl App {
         }
         self.live = scene;
         self.live_pos = pos;
+        // a bible verse outside its passage is no longer live (bible_item_show_verse marks
+        // it again right after this)
+        self.bible_nav.outside = None;
         self.blank = false;
         self.broadcast();
     }
@@ -742,6 +815,10 @@ impl App {
 
     /// Selects a slide; with live mode on it also goes live.
     pub fn select(&mut self, item: ItemRef, slide: usize) {
+        // the bible controls follow the selected slide again
+        self.bible_nav.outside = None;
+        self.bible_nav.book = None;
+        self.bible_nav.chapter = None;
         self.sel_item = Some(item);
         self.sel_slide = slide;
         self.scroll_pending = true;
@@ -779,6 +856,10 @@ impl App {
     }
 
     pub fn step_slide(&mut self, forward: bool) {
+        // a verse of the book outside the passage is live: the next / previous verse
+        if self.bible_step_outside(forward) {
+            return;
+        }
         let Some(item) = self.sel_item.or_else(|| (self.service_len() > 0).then_some(ItemRef::Service(0))) else { return };
         let n = self.slides_of(item).len();
         if self.sel_item.is_none() {
@@ -1021,6 +1102,7 @@ impl App {
             files::Purpose::ImportBackup => self.import_backup_file(first),
             files::Purpose::ImportBible => self.import_bible_files(chosen),
             files::Purpose::ImportLegacy => self.import_legacy_files(chosen),
+            files::Purpose::Background(target) => self.background_file_chosen(target, &first),
             files::Purpose::DesignerAddImage => {
                 if let Some(media) = self.store_image(&first) {
                     self.designer_add(ObjectKind::Image { media, opacity: 1.0 });
@@ -1215,6 +1297,35 @@ impl App {
         self.notify(tf("service.added", &[("title", &title)]));
     }
 
+    /// "Add to service" of the open tab (its button, [`Action::AddToService`], the
+    /// `add-to-service` command): Songs the open song, Bible the selected verses (all found
+    /// when none is selected), Slide designer the open design, Service the quick passage.
+    /// Returns the added item's title.
+    pub fn add_selected_to_service(&mut self) -> Result<String, String> {
+        let kind = match self.tab {
+            Tab::Songs => ItemKind::Song(self.songs.song.clone()),
+            Tab::Designer => ItemKind::Design(self.designer.design.clone()),
+            Tab::Bible => ItemKind::Bible(self.bible_selected_passage().ok_or("nothing found to add (search the bible first)")?),
+            Tab::Service => return self.add_quick_to_service().ok_or_else(|| "no quick passage to add (Bible tab › Show live)".into()),
+            Tab::Settings => return Err("nothing to add in the Settings tab".into()),
+        };
+        let title = ServiceItem::new(kind.clone()).title();
+        self.add_to_service(kind);
+        Ok(title)
+    }
+
+    /// Adds the quick passage (shown live from the Bible tab) to the service; it is no
+    /// longer a quick passage then. Returns its title.
+    pub fn add_quick_to_service(&mut self) -> Option<String> {
+        let q = self.quick.take()?;
+        let title = q.title();
+        self.add_to_service(q.kind);
+        if self.sel_item == Some(ItemRef::Quick) {
+            self.sel_item = None;
+        }
+        Some(title)
+    }
+
     // -----------------------------------------------------------------------
     // Imports
 
@@ -1349,6 +1460,8 @@ impl App {
                     self.settings.bible = Some(bible.meta.id.clone());
                     self.bible.current = Some(bible);
                     self.bible.bibles = crate::bible::list_bibles();
+                    // a bible imported again under its id: its new text
+                    self.bible_cache.clear();
                     self.bible.index = None;
                     self.bible.offer_index = None;
                     self.save_settings();
@@ -1398,6 +1511,11 @@ impl App {
                 Action::Blank => self.toggle_blank(),
                 Action::Freeze => self.toggle_freeze(),
                 Action::RenameItem => self.open_rename_dialog(),
+                Action::AddToService => {
+                    if let Err(e) = self.add_selected_to_service() {
+                        self.notify(e);
+                    }
+                }
                 Action::VideoPlayPause => {
                     if let Some(target) = self.play_pause_target() {
                         self.video_play_pause(target);
@@ -1456,11 +1574,30 @@ impl App {
             Action::PinPassage => self.tab == Tab::Bible,
             Action::Undo | Action::Redo => self.tab == Tab::Designer,
             Action::RenameItem => self.tab == Tab::Service && matches!(self.sel_item, Some(ItemRef::Service(_))),
+            Action::AddToService => match self.tab {
+                Tab::Service => self.quick.is_some(),
+                Tab::Settings => false,
+                _ => true,
+            },
             Action::VideoPlayPause => self.play_pause_target().is_some(),
             Action::VideoForward | Action::VideoBack => self.video_key_target().is_some(),
             // arrow keys move objects in the designer
             a if a.is_navigation() => self.presenting(),
             _ => true,
+        }
+    }
+
+    /// Whether a key of `a` pressed in the output window is sent to the main window: the
+    /// slide keys always, the others when the main window would act on them. Not the keys
+    /// that work in a field of the main window (search, rename, the designer's undo).
+    pub(crate) fn output_action_enabled(&self, a: Action) -> bool {
+        match a {
+            Action::Find | Action::RenameItem | Action::Undo | Action::Redo => false,
+            Action::ToggleOutput | Action::OutputFullscreen => true,
+            a if a.is_navigation() => true,
+            // the main window takes no keys while a dialog or key capture is open
+            _ if self.capture.is_some() || self.dialog.is_some() || self.file_dialog.is_some() => false,
+            a => self.action_enabled(a),
         }
     }
 
@@ -1530,6 +1667,7 @@ impl App {
             self.refresh_output_monitor();
         }
         let scene = self.output_scene();
+        let enabled: Vec<Action> = Action::ALL.iter().copied().filter(|a| self.output_action_enabled(*a)).collect();
         let mut save = false;
         let mut lost = false;
         let escape;
@@ -1561,6 +1699,7 @@ impl App {
             // a window (not full screen) shows the pointer, so it can be moved and resized
             o.hide_cursor = self.settings.output_always_on_top && self.output_fullscreen;
             o.shortcuts = self.settings.shortcuts.clone();
+            o.enabled = enabled;
             o.mark_keys = self.mark_keys();
             // remember the screen the output was shown on (it opens there next time)
             if let Some(i) = o.on_screen
@@ -1981,6 +2120,7 @@ impl App {
                             t("delete"),
                             Some(Box::new(move |app| {
                                 Bible::delete(&id);
+                                app.bible_cache.remove(&id);
                                 app.bible.bibles = crate::bible::list_bibles();
                                 if app.bible.current.as_ref().map(|b| b.meta.id == id).unwrap_or(false) {
                                     app.bible.current = None;
@@ -2151,13 +2291,7 @@ impl App {
             }
             ui.separator();
             self.alt_nav.tab_ids.clear();
-            for (tab, key, action) in [
-                (Tab::Service, "tab.service", Action::TabService),
-                (Tab::Songs, "tab.songs", Action::TabSongs),
-                (Tab::Designer, "tab.designer", Action::TabDesigner),
-                (Tab::Bible, "tab.bible", Action::TabBible),
-                (Tab::Settings, "tab.settings", Action::TabSettings),
-            ] {
+            for (n, (tab, key, action)) in TABS.into_iter().enumerate() {
                 let mut label = t(key);
                 if (tab == Tab::Service && self.service_dirty)
                     || (tab == Tab::Songs && self.songs.dirty)
@@ -2165,7 +2299,9 @@ impl App {
                 {
                     label.push_str(" •");
                 }
-                let r = ui.selectable_label(self.tab == tab, label).on_hover_text(sc.describe(action));
+                // Alt+3 … Alt+7: after the two menus (see keynav::bar_items)
+                let keys = format!("{}\nAlt+{}", sc.describe(action), n + 3);
+                let r = ui.selectable_label(self.tab == tab, label).on_hover_text(keys.trim_start());
                 self.alt_nav.tab_ids.push((tab, r.id));
                 if r.clicked() {
                     self.tab = tab;
@@ -2261,8 +2397,16 @@ fn output_frame(ui: &mut egui::Ui, o: &mut OutputShared, title: &str, root: bool
     }
     if o.keys_enabled && vctx.input(|i| i.focused) {
         let focus = shortcuts::KeyFocus::of(&vctx, false);
+        // the keys work as in the main window (the operator often clicks the output); an
+        // output drawn inside the main window (embedded viewports) leaves them to the main
+        // window, except the slide and output keys
+        let embedded = !root && vctx.embed_viewports();
         let actions = o.shortcuts.triggered(&vctx, focus, |a| {
-            a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen | Action::VideoPlayPause)
+            if embedded {
+                a.is_navigation() || matches!(a, Action::ToggleOutput | Action::OutputFullscreen | Action::VideoPlayPause)
+            } else {
+                o.enabled.contains(&a)
+            }
         });
         if let Some(j) = o.mark_keys.consume(&vctx, shortcuts::KeyFocus::None) {
             o.jump = Some(j);
@@ -2485,6 +2629,14 @@ impl App {
         }
     }
 
+    /// Asks the system to stay awake while `prevent_sleep` is on (not in tests).
+    fn sync_awake(&mut self) {
+        let want = self.settings.prevent_sleep && !cfg!(test);
+        if want != self.awake.is_some() {
+            self.awake = want.then(crate::awake::Inhibitor::start);
+        }
+    }
+
     /// The desktop's keys are off while the output is full screen on another screen.
     fn sync_desktop_guard(&mut self) {
         let want = self.settings.guard_desktop_keys && self.output_on_other_screen();
@@ -2630,6 +2782,7 @@ impl App {
         }
         self.show_output(&ctx);
         self.sync_desktop_guard();
+        self.sync_awake();
         if self.cli {
             // `--cli`: this window is the output; nothing else is shown
             let shared = self.output.clone();

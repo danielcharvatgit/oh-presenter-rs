@@ -80,7 +80,7 @@ impl App {
             {
                 self.save_song(true, false);
             }
-            if ui.button((super::plus_icon(), t("songs.add_to_service"))).clicked() {
+            if ui.button((super::plus_icon(), t("songs.add_to_service"))).on_hover_text(sc.describe(Action::AddToService)).clicked() {
                 self.add_to_service(ItemKind::Song(self.songs.song.clone()));
             }
             if ui.button(t("songs.export")).on_hover_text(t("songs.export_hint")).clicked() {

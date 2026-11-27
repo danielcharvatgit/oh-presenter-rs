@@ -9,9 +9,12 @@ pub const CANVAS_H: f32 = 720.0;
 pub fn make_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut x = nanos ^ (n.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (std::process::id() as u64) << 32;
+    let mut x = id_seed() ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // xorshift has a fixed point at 0
+    if x == 0 {
+        x = 0x2545_F491_4F6C_DD1D;
+    }
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut s = String::with_capacity(16);
     for _ in 0..16 {
@@ -22,6 +25,22 @@ pub fn make_id() -> String {
         s.push(CHARS[(x % CHARS.len() as u64) as usize] as char);
     }
     s
+}
+
+/// Time and process id: differ between runs of the program.
+#[cfg(not(target_arch = "wasm32"))]
+fn id_seed() -> u64 {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    nanos ^ (std::process::id() as u64) << 32
+}
+
+/// In the browser (the web edition) there is no system clock or process id in `std`: the
+/// page's clock and random numbers.
+#[cfg(target_arch = "wasm32")]
+fn id_seed() -> u64 {
+    let now = js_sys::Date::now() as u64;
+    let r = (js_sys::Math::random() * u32::MAX as f64) as u64;
+    now ^ r << 32
 }
 
 /// RGBA color, not premultiplied.
@@ -267,8 +286,9 @@ fn yes() -> bool {
 /// How several shown columns are placed on a slide.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnLayout {
-    #[default]
     SideBySide,
+    /// One below the other, an empty line between them (the default since 0.3.0).
+    #[default]
     Stacked,
 }
 
@@ -376,19 +396,98 @@ impl Song {
 // ---------------------------------------------------------------------------
 // Bible passage attached to a service
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PassageVerse {
     pub book: String,
     pub chapter: u32,
     pub verse: u32,
     pub text: String,
+    /// Canonical book number (1 = Genesis … 66 = Revelation); 0 = unknown (older files).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub book_number: u32,
+    /// The verse in the further shown translations ([`Passage::extra_bibles`]), in their order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Passage {
     pub reference: String,
     pub version: String,
     pub verses: Vec<PassageVerse>,
+    /// Id of the bible the verses are from; empty = older files (found by `version` then).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bible: String,
+    /// Further translations shown below the main one (bible ids, one per language).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_bibles: Vec<String>,
+    /// Their abbreviations (for the reference under the text).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_versions: Vec<String>,
+}
+
+impl Passage {
+    /// All shown translations' bible ids: the main one first.
+    pub fn shown_bibles(&self) -> Vec<String> {
+        std::iter::once(self.bible.clone()).chain(self.extra_bibles.iter().cloned()).collect()
+    }
+}
+
+/// The reference of verses `from` – `to` ((chapter, verse) pairs) of `book` with the parts
+/// chosen in the settings, e.g. `John 3:16-18`, `3:16`, `John` (`sep` = `:` or `,`).
+pub fn verse_reference(book: &str, from: (u32, u32), to: (u32, u32), parts: &ReferenceParts, sep: &str) -> String {
+    let mut out = String::new();
+    if parts.book && !book.is_empty() {
+        out.push_str(book);
+    }
+    let place = match (parts.chapter, parts.verse) {
+        (true, true) if from == to => format!("{}{sep}{}", from.0, from.1),
+        (true, true) if from.0 == to.0 => format!("{}{sep}{}-{}", from.0, from.1, to.1),
+        (true, true) => format!("{}{sep}{}-{}{sep}{}", from.0, from.1, to.0, to.1),
+        (true, false) if from.0 == to.0 => from.0.to_string(),
+        (true, false) => format!("{}-{}", from.0, to.0),
+        (false, true) if from == to => from.1.to_string(),
+        (false, true) => format!("{}-{}", from.1, to.1),
+        (false, false) => String::new(),
+    };
+    if !place.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&place);
+    }
+    out
+}
+
+/// A picture behind the slides of a service or of one service item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundPicture {
+    /// Name in the media store.
+    pub media: String,
+    /// Size of the picture in pixels (to cover the slide without stretching it).
+    pub width: u32,
+    pub height: u32,
+}
+
+impl BackgroundPicture {
+    /// The picture as a canvas object covering the whole slide (centered; what sticks out is cut).
+    pub fn object(&self) -> CanvasObject {
+        let (w, h) = (self.width.max(1) as f32, self.height.max(1) as f32);
+        let s = (CANVAS_W / w).max(CANVAS_H / h);
+        let (w, h) = (w * s, h * s);
+        CanvasObject {
+            id: format!("background-{}", self.media),
+            x: (CANVAS_W - w) / 2.0,
+            y: (CANVAS_H - h) / 2.0,
+            w,
+            h,
+            kind: ObjectKind::Image { media: self.media.clone(), opacity: 1.0 },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,11 +535,14 @@ pub struct ServiceItem {
     /// The name shown for this item in the service (F2 / Rename); empty = its own title.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// A picture under this item's text slides and its designs with a transparent background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundPicture>,
 }
 
 impl ServiceItem {
     pub fn new(kind: ItemKind) -> Self {
-        Self { id: make_id(), kind, notes: String::new(), name: String::new() }
+        Self { id: make_id(), kind, notes: String::new(), name: String::new(), background: None }
     }
 
     /// The title shown in the service: the name it was renamed to, else its own title.
@@ -473,6 +575,9 @@ impl ServiceItem {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Service {
     pub items: Vec<ServiceItem>,
+    /// A picture under every text slide of the service (not under pictures with transparency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<BackgroundPicture>,
 }
 
 /// Everything needed to show one slide; shown in previews, the output window and
@@ -553,14 +658,79 @@ pub struct TextStyle {
     pub background: Rgba,
     pub color: Rgba,
     pub max_font_size: f32,
+    /// Size of the additional info (bible reference, song title / author).
     pub footer_size: f32,
+    /// Whether the additional info is shown.
     pub show_footer: bool,
     pub shadow: bool,
+    /// Where the text goes up and down on the slide.
+    #[serde(default = "middle")]
+    pub text_valign: VAlign,
+    /// Alignment of the text's lines.
+    #[serde(default)]
+    pub text_halign: HAlign,
+    /// Free space around the text, in canvas points (of 1920 × 1080).
+    #[serde(default = "default_margin")]
+    pub margin: f32,
+    /// Where the additional info goes.
+    #[serde(default)]
+    pub footer_position: FooterPosition,
+    #[serde(default)]
+    pub footer_align: HAlign,
+}
+
+fn middle() -> VAlign {
+    VAlign::Middle
+}
+
+fn default_margin() -> f32 {
+    40.0
+}
+
+/// Where the additional info (reference, song title) of a text slide goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FooterPosition {
+    /// Right below the text (a line of space between).
+    #[default]
+    BelowText,
+    /// At the top edge of the slide.
+    Top,
+    /// At the bottom edge of the slide.
+    Bottom,
 }
 
 impl Default for TextStyle {
     fn default() -> Self {
-        Self { background: Rgba::BLACK, color: Rgba::WHITE, max_font_size: 64.0, footer_size: 20.0, show_footer: true, shadow: true }
+        Self {
+            background: Rgba::BLACK,
+            color: Rgba::WHITE,
+            max_font_size: 64.0,
+            footer_size: 32.0,
+            show_footer: true,
+            shadow: true,
+            text_valign: VAlign::Middle,
+            text_halign: HAlign::Center,
+            margin: default_margin(),
+            footer_position: FooterPosition::BelowText,
+            footer_align: HAlign::Center,
+        }
+    }
+}
+
+/// Which parts of a bible verse's reference are shown with it (Settings › Display).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReferenceParts {
+    pub book: bool,
+    pub chapter: bool,
+    pub verse: bool,
+    /// The translation's abbreviation, e.g. (KJV).
+    pub translation: bool,
+}
+
+impl Default for ReferenceParts {
+    fn default() -> Self {
+        Self { book: true, chapter: true, verse: true, translation: true }
     }
 }
 

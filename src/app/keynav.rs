@@ -5,12 +5,14 @@
 //!   Settings, `Alt+f` = the File menu. A number first picks among several matches:
 //!   `Alt+3s` = the third item starting with "s" (Slide designer); repeating the letter
 //!   cycles through those items: `Alt+sss` = Service › Songs › Slide designer. Holding Alt a moment
-//!   shows all items. Esc cancels.
+//!   shows all items. A number alone picks the n-th item from the left: `Alt+1` File,
+//!   `Alt+2` Output, `Alt+3` Service, `Alt+4` Songs, `Alt+5` Bible, `Alt+6` Slide designer,
+//!   `Alt+7` Settings. Esc cancels.
 //! * **Scrolling** the Songs and Settings tabs with ↑ ↓ PgUp PgDn Home End (in the other
 //!   tabs these keys present slides or move designer objects).
 //! * **Tab / Shift+Tab** move the keyboard focus, starting at the open tab in the top bar
-//!   (from Bible, Tab goes on to Settings and the Bible tab's controls, Shift+Tab back to
-//!   Slide designer, Songs, Service, Output): the focused item gets a clear frame, a
+//!   (from Bible, Tab goes on to Slide designer, Settings and the Bible tab's controls,
+//!   Shift+Tab back to Songs, Service, Output): the focused item gets a clear frame, a
 //!   list scrolls to it when it is out of view ([`FollowFocus`]), and an open menu closes
 //!   when the focus leaves it for the page behind it.
 
@@ -103,17 +105,11 @@ pub enum KeyScroll {
     Bottom,
 }
 
-/// The menus and tabs of the bar with their labels, in the order shown.
+/// The menus and tabs of the bar with their labels, in the order shown (from left to
+/// right: `Alt+1` File, `Alt+2` Output, `Alt+3` Service … `Alt+7` Settings).
 pub fn bar_items() -> Vec<(String, BarItem)> {
-    vec![
-        (t("menu.file"), BarItem::Menu(0)),
-        (t("menu.output"), BarItem::Menu(1)),
-        (t("tab.service"), BarItem::Tab(Tab::Service)),
-        (t("tab.songs"), BarItem::Tab(Tab::Songs)),
-        (t("tab.designer"), BarItem::Tab(Tab::Designer)),
-        (t("tab.bible"), BarItem::Tab(Tab::Bible)),
-        (t("tab.settings"), BarItem::Tab(Tab::Settings)),
-    ]
+    let menus = [(t("menu.file"), BarItem::Menu(0)), (t("menu.output"), BarItem::Menu(1))];
+    menus.into_iter().chain(super::TABS.iter().map(|(tab, key, _)| (t(key), BarItem::Tab(*tab)))).collect()
 }
 
 /// What was typed, understood: the matching items and which of them is chosen

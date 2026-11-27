@@ -7,7 +7,7 @@
 ; (get-ffmpeg.ps1 downloads them); without them the installer is built without video.
 
 #define AppName "oh! Presenter"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppExe "oh-presenter-rs.exe"
 
 ; where cargo put the exe: native Windows build, or cross build with --target

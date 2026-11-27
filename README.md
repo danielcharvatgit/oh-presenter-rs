@@ -4,7 +4,7 @@ A church presentation program for songs, bible passages, videos and designed sli
 in an output window on this computer and on other computers in the LAN. It is a Rust/[egui](https://github.com/emilk/egui)
 rewrite of [oh-presenter](../oh-presenter), licensed under [GPL-3.0-or-later](LICENSE).
 
-Current version: **0.2.0**
+Current version: **0.3.0**
 
 ## Install
 
@@ -81,8 +81,23 @@ The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 * **Pictures as an overlay**: a picture with transparent parts added to the service (➕ Image) gets a transparent
   background. With Settings → *Advanced settings* → *Transparent output* (and *keep above all other windows*), the
   output window shows what is behind it there, for example a trailer played full screen in another video player.
-* **Bible**: search by reference (`J 3,16-18`, `John 3:16`) or by words. No bible text is included, so import one.
-* **Output window**: opens full screen on a second screen (projector), or press F5 to open it as a normal window.
+* **Bible**: search by reference (`J 3,16-18`, `John 3:16`) or by words; word search can be limited to the Old or
+  New Testament and to one book. No bible text is included, so import one.
+* **Bible passages in the service**: select one in the Service tab to get its controls: the translations of the chosen
+  language, the languages shown on the output (several at once, one below the other), the verse shown now, the
+  chapters and verses of the whole book, and the chapter's text in one language. A click on any verse shows it live
+  (a verse outside the passage does not change the item; ↓ / ↑ go on through the book).
+* **Background pictures**: for the whole service (under every text slide) and for one item (under its text, or under
+  its picture with transparency): the Service tab, or *Background picture…* in an item's menu. They are saved in the
+  `.ohsvc` file.
+* **Text on the slides**: other languages of a song or bible are shown one below the other with an empty line between
+  them, the reference / song title right below the text in a smaller font. Settings → *Display* sets the text size,
+  its position, the margin, where the additional info goes and which parts of a bible reference are shown. The bible
+  reference and the song / text title are turned on and off separately (*Bible: show the reference*, *Songs and
+  texts: show the title*).
+* **Keeps the computer awake** while the program runs (no sleep, no screen blanking or locking; Settings → *General*).
+* **Output window**: opens full screen on a second screen (projector), or press F5 to open it as a normal window. It
+  stays above all other windows by default. The keyboard shortcuts also work while the output window has the keyboard.
   Leaving full screen on the projector from the output window itself (F11, Esc, double click) asks first; Esc
   answers *Cancel* there too, even when the output window has the keyboard.
 * **Desktop kept off the projector** (Settings → *Advanced settings*, on by default): while the output is full screen
@@ -95,15 +110,28 @@ The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 * **Import / export**: `.ohsvc`, OpenLP, OpenLyrics, ChordPro, plain text, Zefania / OSIS / OpenSong / plain-text bibles
   (a bible can also be exported as `.txt`), `.ohbackup` backups and files of the old oh-presenter.
 * **Languages**: Czech and English. To add another, use Settings → *Create translation template*.
-* **Keyboard**: every shortcut can be changed in Settings → *Keyboard shortcuts*. Alt+1 / Alt+2 open the File /
-  Output menu. Tab moves the keyboard focus forward and Shift+Tab back, both starting at the open tab. In the Service
+* **Keyboard**: every shortcut can be changed in Settings → *Keyboard shortcuts*. Ctrl+1 … Ctrl+5 switch the tabs
+  (Service, Songs, Bible, Slide designer, Settings; since 0.3 Ctrl+3 is the Bible and Ctrl+4 the designer, the old
+  default keys are changed). Alt+1 … Alt+7 choose the items of the top bar from left to right (Alt+1 File, Alt+2 Output, Alt+3 Service,
+  Alt+4 Songs, Alt+5 Bible, Alt+6 Slide designer, Alt+7 Settings). Ctrl+Enter adds to the service what the open tab
+  would add with its *Add to service* button (the open song or design, the selected bible verses, in the Service tab
+  the quick passage). Tab moves the keyboard focus forward and Shift+Tab back, both starting at the open tab. In the Service
   tab every key works wherever you clicked (except in a text field):
   `,` freezes the output (it keeps its picture while you change slides, also on Windows, where it was F8 before 0.2;
   an old F8 setting is changed to `,`), F2 renames the selected item, and Space plays / pauses the live video (or
   shows the selected video live) — also with the focus on the item list; Space never moves to another slide or item.
   ← / → move a video 5 seconds once you clicked it, its preview or the live panel. Ctrl+Shift+← → moves between the
   columns and ← → move a focused column border (Shift: bigger steps).
+  The Service tab's columns keep the widths you give them: a long live title is cut (whole on hover), and a small or
+  minimized window only narrows them until it is big again; the slides column in the middle always stays visible.
 * **Output on a second screen**: leaving full screen or closing the output there (F11, F5, Esc, a double click) is confirmed in the program window first, because you do not see the projector.
+
+## Web edition
+
+`web/` is a separate program for the browser (Rust + WebAssembly, works offline): the service,
+songs, bibles, an output window, the same slides and `.ohsvc` files, keys that do not clash with
+the browser, and WebMCP tools for code agents instead of the command line. See
+[web/README.md](web/README.md).
 
 ## Command line (`--cli`)
 
@@ -129,6 +157,8 @@ oh-presenter-rs --cli --service sunday.ohsvc --service-item video.mp4 --playback
 Typed commands (one per line, `help` lists them all, `quit` ends): `next-slide`, `prev-slide`, `select-item 3`,
 `select-slide 2`, `go-live`, `blank on`, `freeze`, `playback-control pause`, `playback-control seek seconds=90`,
 `alert The owner of car 1AB 2345 is asked to come out`, `output windowed`, `bible search John 3:16`, `bible show`,
+`bible search testament=new book=John love`, `list-bible-books`, `bible-item language=cs show=on`, `bible-item 3 16`,
+`set-background service /path/picture.jpg`, `add-to-service tab=bible`,
 `list-items`, `status`, `set-setting language "cs"`, … On Windows, start it from a command prompt with
 `start /wait oh-presenter-rs --cli …` so the prompt does not read the same keys.
 

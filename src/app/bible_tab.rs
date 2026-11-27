@@ -123,6 +123,7 @@ impl App {
         if has_number && let Some(ranges) = &ranges {
             let hits: Vec<Hit> = ranges.iter().flat_map(|r| bible.verses_in(r)).collect();
             if !hits.is_empty() {
+                self.bible.word_search = false;
                 let reference = bible.format_reference(&hits, &lang);
                 self.bible.info = tf("bible.found_ref", &[("ref", &reference), ("n", &hits.len().to_string())]);
                 self.bible.bookmarks.visit(Bookmark { reference, bible: bible.meta.id.clone(), note: String::new() });
@@ -137,6 +138,7 @@ impl App {
             self.bible.book_hint = ranges.and_then(|r| r.first().map(|r| r.book));
         }
         self.bible.results.clear();
+        self.bible.word_search = true;
         self.bible_word_search(&query);
     }
 
@@ -154,11 +156,24 @@ impl App {
         let verses = hits
             .iter()
             .filter_map(|h| {
-                let (_, c, v) = bible.verse(h)?;
-                Some(PassageVerse { book: bible.book_name(h.book, &lang), chapter: c.number, verse: v.number, text: v.text.clone() })
+                let (b, c, v) = bible.verse(h)?;
+                Some(PassageVerse {
+                    book: bible.book_name(h.book, &lang),
+                    chapter: c.number,
+                    verse: v.number,
+                    text: v.text.clone(),
+                    book_number: b.number,
+                    extra: Vec::new(),
+                })
             })
             .collect();
-        Some(Passage { reference: bible.format_reference(&hits, &lang), version: bible.meta.abbrev.clone(), verses })
+        Some(Passage {
+            reference: bible.format_reference(&hits, &lang),
+            version: bible.meta.abbrev.clone(),
+            verses,
+            bible: bible.meta.id.clone(),
+            ..Default::default()
+        })
     }
 
     pub(super) fn bible_show_live(&mut self) {
@@ -228,8 +243,47 @@ impl App {
             }
         });
 
-        // browse by book / chapter
+        // what the word search keeps: a testament, a book
         let lang = current_language();
+        let mut refilter = false;
+        if let Some(bible) = &self.bible.current {
+            use crate::bible::Testament;
+            let f = &mut self.bible.filter;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t("bible.filter")).on_hover_text(t("bible.filter_hint"));
+                for tm in [Testament::All, Testament::Old, Testament::New] {
+                    if ui.selectable_label(f.testament == tm, t(tm.label_key())).clicked() && f.testament != tm {
+                        f.testament = tm;
+                        // a book of the other testament is no longer offered
+                        if f.book.is_some_and(|b| !tm.contains(b)) {
+                            f.book = None;
+                        }
+                        refilter = true;
+                    }
+                }
+                let name = |n: u32| {
+                    bible.books.iter().position(|b| b.number == n).map(|i| bible.book_name(i, &lang)).unwrap_or_else(|| n.to_string())
+                };
+                let shown = f.book.map(name).unwrap_or_else(|| t("bible.all_books"));
+                egui::ComboBox::from_id_salt("filter_book").selected_text(shown).height(400.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(f.book.is_none(), t("bible.all_books")).clicked() && f.book.is_some() {
+                        f.book = None;
+                        refilter = true;
+                    }
+                    for (i, b) in bible.books.iter().enumerate().filter(|(_, b)| f.testament.contains(b.number)) {
+                        if ui.selectable_label(f.book == Some(b.number), bible.book_name(i, &lang)).clicked() && f.book != Some(b.number) {
+                            f.book = Some(b.number);
+                            refilter = true;
+                        }
+                    }
+                });
+            });
+        }
+        if refilter && self.bible.word_search && !self.bible.query.trim().is_empty() {
+            self.run_bible_search();
+        }
+
+        // browse by book / chapter
         let mut browse = false;
         if let Some(bible) = &self.bible.current {
             ui.horizontal(|ui| {
@@ -285,7 +339,7 @@ impl App {
                 if ui.button(format!("▶ {}", t("bible.show_live"))).on_hover_text(t("bible.show_live_hint")).clicked() {
                     self.bible_show_live();
                 }
-                if ui.button((super::plus_icon(), t("bible.add_to_service"))).clicked()
+                if ui.button((super::plus_icon(), t("bible.add_to_service"))).on_hover_text(sc.describe(Action::AddToService)).clicked()
                     && let Some(p) = self.bible_selected_passage()
                 {
                     self.add_to_service(ItemKind::Bible(p));

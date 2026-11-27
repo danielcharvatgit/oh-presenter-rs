@@ -1,11 +1,16 @@
 [package]
 name = "oh-presenter-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Church presentation program: songs, bible passages, videos and designed slides, with output windows on the LAN"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/danielcharvatgit/oh-presenter-rs"
 build = "build.rs"
+
+[features]
+default = ["sqlite"]
+# OpenLP bible databases (src/bible.rs); the web edition, which shares that file, has none
+sqlite = []
 
 [dependencies]
 base64 = "0.23.1"
@@ -27,6 +32,11 @@ tar = "0.4.46"
 # the screens (monitors) of the main window; the version eframe uses, no extra features
 winit = { version = "0.30", default-features = false }
 zip = "9.8.2"
+
+# Linux: asks the desktop over D-Bus not to sleep / lock while the program runs
+# (already a dependency of the accessibility support, no new crates)
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 
 [build-dependencies]
 winresource = "0.1.34"

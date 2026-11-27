@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111827">
+    <meta name="description" content="Songs, bible passages and texts on a projector — offline, in the browser">
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <title>oh! Presenter</title>
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #111827; }
+      canvas { display: block; width: 100%; height: 100%; outline: none; }
+      #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #9ca3af; font: 16px sans-serif; }
+    </style>
+  </head>
+  <body>
+    <div id="loading">oh! Presenter…</div>
+    <canvas id="app" aria-label="oh! Presenter"></canvas>
+    <script type="module">
+      import init from "./oh-presenter-web.js";
+      // the output window has no worker of its own to register
+      if ("serviceWorker" in navigator && location.hash !== "#output") {
+        navigator.serviceWorker.register("./sw.js").catch((e) => console.warn("offline cache:", e));
+      }
+      init().then(() => document.getElementById("loading").remove())
+        .catch((e) => { document.getElementById("loading").textContent = "oh! Presenter could not start: " + e; });
+    </script>
+  </body>
+</html>

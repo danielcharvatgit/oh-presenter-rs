@@ -243,6 +243,13 @@ impl App {
                 }
                 Ok("added picture".into())
             }
+            "add-to-service" => {
+                if args.contains_key("tab") {
+                    self.tab = tab_named(text(args, "tab"));
+                }
+                let title = self.add_selected_to_service()?;
+                Ok(format!("added {title}"))
+            }
             "add-video" => {
                 let f = PathBuf::from(text(args, "file"));
                 if !f.is_file() {
@@ -373,12 +380,7 @@ impl App {
                 Ok("alert stopped".into())
             }
             "show-tab" => {
-                self.tab = match text(args, "tab") {
-                    "songs" => Tab::Songs,
-                    "bible" => Tab::Bible,
-                    "settings" => Tab::Settings,
-                    _ => Tab::Service,
-                };
+                self.tab = tab_named(text(args, "tab"));
                 Ok(format!("{:?}", self.tab))
             }
             "list-songs" => {
@@ -407,6 +409,9 @@ impl App {
                 Ok(if list.is_empty() { "no bibles".into() } else { list.join("\n") })
             }
             "bible" => self.bible_command(args),
+            "list-bible-books" => self.list_bible_books(args),
+            "bible-item" => self.bible_item_command(args),
+            "set-background" => self.set_background_command(args),
             "status" => Ok(self.status_text()),
             "get-settings" => serde_json::to_string_pretty(&self.settings).map_err(|e| e.to_string()),
             "set-setting" => self.set_setting(text(args, "key"), text(args, "value"), ctx),
@@ -480,17 +485,42 @@ impl App {
         Ok(self.status_text())
     }
 
+    /// A bible by id, name or abbreviation (case and accents ignored).
+    fn find_bible(&self, want: &str) -> Result<String, String> {
+        let f = crate::storage::fold(want);
+        self.bible
+            .bibles
+            .iter()
+            .find(|b| crate::storage::fold(&b.id) == f || crate::storage::fold(&b.name) == f || crate::storage::fold(&b.abbrev) == f)
+            .map(|b| b.id.clone())
+            .ok_or_else(|| format!("no bible {want:?} (list-bibles)"))
+    }
+
+    /// `list-bible-books`: the books of a bible.
+    fn list_bible_books(&mut self, args: &Args) -> Result<String, String> {
+        let want = text(args, "bible");
+        let id = if want.is_empty() {
+            self.bible.current.as_ref().map(|b| b.meta.id.clone()).ok_or("no bible is open (list-bibles, then bible=<id>)")?
+        } else {
+            self.find_bible(want)?
+        };
+        let testament = crate::bible::Testament::parse(text(args, "testament")).unwrap_or_default();
+        let bible = self.cached_bible(&id).ok_or("the bible could not be read")?;
+        let lang = crate::i18n::current_language();
+        let list: Vec<String> = bible
+            .books
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| testament.contains(b.number))
+            .map(|(i, b)| format!("{:>3}  {}  ({} chapters)", b.number, bible.book_name(i, &lang), b.chapters.len()))
+            .collect();
+        Ok(if list.is_empty() { "no books".into() } else { list.join("\n") })
+    }
+
     fn bible_command(&mut self, args: &Args) -> Result<String, String> {
         let want = text(args, "bible");
         if !want.is_empty() {
-            let f = crate::storage::fold(want);
-            let id = self
-                .bible
-                .bibles
-                .iter()
-                .find(|b| crate::storage::fold(&b.id) == f || crate::storage::fold(&b.name) == f || crate::storage::fold(&b.abbrev) == f)
-                .map(|b| b.id.clone())
-                .ok_or_else(|| format!("no bible {want:?} (list-bibles)"))?;
+            let id = self.find_bible(want)?;
             if self.bible.current.as_ref().map(|b| &b.meta.id) != Some(&id) {
                 self.switch_bible(&id);
             }
@@ -498,24 +528,50 @@ impl App {
         if self.bible.current.is_none() {
             return Err("no bible is open (list-bibles, then bible=<id>)".into());
         }
+        // the word search's filter (it stays set, as in the Bible tab)
+        if let Some(tm) = args.get("testament").and_then(Value::as_str) {
+            self.bible.filter.testament =
+                crate::bible::Testament::parse(tm).ok_or_else(|| format!("testament: all, old or new, not {tm:?}"))?;
+            if self.bible.filter.book.is_some_and(|b| !self.bible.filter.testament.contains(b)) {
+                self.bible.filter.book = None;
+            }
+        }
+        if let Some(book) = args.get("book").and_then(Value::as_str) {
+            self.bible.filter.book = if book.trim().is_empty() || crate::storage::fold(book) == "all" {
+                None
+            } else {
+                let bible = self.bible.current.as_ref().ok_or("no bible")?;
+                let i = bible
+                    .find_book(book, &crate::i18n::current_language())
+                    .ok_or_else(|| format!("no book {book:?} (list-bible-books)"))?;
+                Some(bible.books[i].number)
+            };
+        }
         let query = text(args, "query");
+        let filtered = args.contains_key("testament") || args.contains_key("book");
         if !query.is_empty() {
             self.bible.query = query.to_string();
+            self.run_bible_search();
+        } else if filtered && self.bible.word_search && !self.bible.query.trim().is_empty() {
+            // a changed filter runs the last word search again (as in the Bible tab)
             self.run_bible_search();
         }
         match text(args, "action") {
             "search" => {
                 let bible = self.bible.current.as_ref().ok_or("no bible")?;
                 let lang = crate::i18n::current_language();
+                let sep = if lang == "cs" { "," } else { ":" };
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 500) as usize;
                 let mut out = String::new();
-                for h in self.bible.results.iter().take(50) {
-                    if let Some((b, c, v)) = bible.verse(h) {
-                        let _ = b;
-                        out.push_str(&format!("{} {}:{}  {}\n", bible.book_name(h.book, &lang), c.number, v.number, v.text));
+                for h in self.bible.results.iter().take(limit) {
+                    if let Some((_, c, v)) = bible.verse(h) {
+                        out.push_str(&format!("{} {}{sep}{}  {}\n", bible.book_name(h.book, &lang), c.number, v.number, v.text));
                     }
                 }
                 if out.is_empty() {
-                    out = "nothing found".into();
+                    out = if self.bible.info.is_empty() { "nothing found".into() } else { self.bible.info.clone() };
+                } else if self.bible.results.len() > limit {
+                    out.push_str(&format!("… {} verses found, {limit} listed (limit=)", self.bible.results.len()));
                 }
                 Ok(out.trim_end().to_string())
             }
@@ -556,5 +612,110 @@ impl App {
         }
         self.save_settings();
         Ok(format!("{key} set"))
+    }
+
+    /// `bible-item`: the selected bible item's translations, languages and the verse shown.
+    fn bible_item_command(&mut self, args: &Args) -> Result<String, String> {
+        let r = self.sel_item.ok_or("no item is selected (select-item first)")?;
+        if !matches!(self.item(r).map(|it| &it.kind), Some(ItemKind::Bible(_))) {
+            return Err("the selected item is not a bible passage".into());
+        }
+        let p = match self.item(r).map(|it| &it.kind) {
+            Some(ItemKind::Bible(p)) => p.clone(),
+            _ => unreachable!(),
+        };
+        self.passage_bible_id(&p).ok_or_else(|| format!("the passage's bible ({}) is not installed (list-bibles)", p.version))?;
+        let translation = text(args, "translation");
+        if !translation.is_empty() {
+            let id = self.find_bible(translation)?;
+            self.bible_item_translation(r, &id);
+        }
+        let language = text(args, "language");
+        if !language.is_empty() {
+            let code = crate::bible::normalize_language(language);
+            if !self.bible.bibles.iter().any(|b| b.language == code) {
+                return Err(format!("no bible in language {language:?} (list-bibles)"));
+            }
+            let on = args.get("show").and_then(Value::as_str).is_none_or(|s| s == "on");
+            let shown_langs: Vec<String> = p
+                .shown_bibles()
+                .iter()
+                .filter_map(|id| self.bible.bibles.iter().find(|b| &b.id == id).map(|b| b.language.clone()))
+                .collect();
+            if !on && shown_langs.len() <= 1 && shown_langs.contains(&code) {
+                return Err("the only shown language cannot be turned off".into());
+            }
+            self.bible_item_language(r, &code, on);
+        }
+        let chapter = args.get("chapter").and_then(Value::as_u64).map(|n| n as u32);
+        let verse = args.get("verse").and_then(Value::as_u64).map(|n| n as u32);
+        if chapter.is_some() || verse.is_some() {
+            let (book, now_chapter, _) = self.bible_now(r).ok_or("the passage has no verse numbers")?;
+            let chapter = chapter.unwrap_or(now_chapter);
+            let verse = verse.unwrap_or(1);
+            if !self.bible_item_show_verse(r, book, chapter, verse) {
+                return Err(format!("no verse {chapter}:{verse} in this book"));
+            }
+        }
+        // what it shows now
+        let p = match self.item(r).map(|it| &it.kind) {
+            Some(ItemKind::Bible(p)) => p.clone(),
+            _ => return Err("the item is gone".into()),
+        };
+        let shown: Vec<String> = p
+            .shown_bibles()
+            .iter()
+            .filter_map(|id| self.bible.bibles.iter().find(|b| &b.id == id))
+            .map(|b| format!("{} ({}, {})", b.abbrev, b.name, b.language))
+            .collect();
+        let now = match self.bible_now(r) {
+            Some((b, c, v)) => {
+                let bible = self.passage_bible_id(&p).and_then(|id| self.cached_bible(&id));
+                let name = bible
+                    .as_ref()
+                    .and_then(|bb| bb.books.iter().position(|x| x.number == b).map(|i| bb.book_name(i, &crate::i18n::current_language())))
+                    .unwrap_or_default();
+                let text =
+                    bible.as_ref().and_then(|bb| super::bible_item::find_verse(bb, b, c, v)).map(|x| x.text.clone()).unwrap_or_default();
+                format!("{name} {c}:{v}  {text}")
+            }
+            None => "-".into(),
+        };
+        Ok(format!("passage: {}\nshown: {}\nnow: {now}\n{}", p.reference, shown.join(", "), self.status_text()))
+    }
+
+    /// `set-background`: the service's or the selected item's background picture.
+    fn set_background_command(&mut self, args: &Args) -> Result<String, String> {
+        use super::backgrounds::BackgroundTarget;
+        let target = if text(args, "scope") == "service" {
+            BackgroundTarget::Service
+        } else {
+            BackgroundTarget::Item(self.service.items[self.selected_index()?].id.clone())
+        };
+        if flag(args, "clear") {
+            self.set_background(&target, None)?;
+            return Ok("background picture removed".into());
+        }
+        let f = PathBuf::from(text(args, "file"));
+        if text(args, "file").is_empty() {
+            return Err("set-background needs file=<picture> or clear=true".into());
+        }
+        if !f.is_file() {
+            return Err(format!("no such file: {}", f.display()));
+        }
+        let pic = Self::background_picture(&f)?;
+        self.set_background(&target, Some(pic))?;
+        Ok("background picture set".into())
+    }
+}
+
+/// A tab by its name in the commands (`show-tab`, `add-to-service`).
+fn tab_named(name: &str) -> Tab {
+    match name {
+        "songs" => Tab::Songs,
+        "bible" => Tab::Bible,
+        "designer" => Tab::Designer,
+        "settings" => Tab::Settings,
+        _ => Tab::Service,
     }
 }

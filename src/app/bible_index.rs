@@ -190,7 +190,9 @@ impl App {
         }
         match &self.bible.index {
             Some((_, idx)) => {
-                let hits = idx.search(query, 500);
+                let filter = self.bible.filter;
+                let books = &self.bible.current.as_ref().map(|b| b.books.iter().map(|b| b.number).collect::<Vec<_>>()).unwrap_or_default();
+                let hits = idx.search_where(query, 500, |h| books.get(h.book).is_some_and(|n| filter.accepts(*n)));
                 self.bible.info = if hits.len() >= 500 {
                     tf("bible.found_text_many", &[("n", "500")])
                 } else {

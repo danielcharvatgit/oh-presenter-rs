@@ -25,6 +25,8 @@ finish-args:
   # "keep the desktop off the projector": turns the Super key of GNOME / Cinnamon / Plasma off
   # while presenting (gsettings / kwriteconfig6 of the desktop, run with flatpak-spawn --host)
   - --talk-name=org.freedesktop.Flatpak
+  # "keep the computer awake": the desktop portal (always allowed), else the screen saver
+  - --talk-name=org.freedesktop.ScreenSaver
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:

@@ -100,6 +100,9 @@ pub enum Action {
     SaveAs,
     /// Rename the selected service item (Service tab).
     RenameItem,
+    /// "Add to service" of the open tab: the open song / design, the selected bible verses,
+    /// the quick passage (Service tab).
+    AddToService,
     /// Play / pause the video (Service tab: the selected or the live video).
     VideoPlayPause,
     /// Video 5 seconds forward.
@@ -124,8 +127,8 @@ pub enum Action {
     Find,
     TabService,
     TabSongs,
-    TabDesigner,
     TabBible,
+    TabDesigner,
     TabSettings,
     PinPassage,
     Undo,
@@ -140,6 +143,7 @@ impl Action {
         Action::Save,
         Action::SaveAs,
         Action::RenameItem,
+        Action::AddToService,
         // before the slide keys: on a video they take Space / ← / → first
         Action::VideoPlayPause,
         Action::VideoForward,
@@ -160,8 +164,8 @@ impl Action {
         Action::Find,
         Action::TabService,
         Action::TabSongs,
-        Action::TabDesigner,
         Action::TabBible,
+        Action::TabDesigner,
         Action::TabSettings,
         Action::PinPassage,
         Action::Undo,
@@ -204,13 +208,17 @@ impl Action {
     }
 
     /// Default keys of older versions that were changed since: saved settings with exactly
-    /// these keys get the new defaults (0.1.x: Freeze was F8, Space was also the next slide).
+    /// these keys get the new defaults (0.1.x: Freeze was F8, Space was also the next slide;
+    /// 0.2.x: Ctrl+3 / Ctrl+4 were the designer / the bible).
     pub fn old_defaults(self) -> Option<Vec<KeyBinding>> {
         use Key::*;
         let p = KeyBinding::plain;
         match self {
             Action::Freeze => Some(vec![p(F8)]),
             Action::NextSlide => Some(vec![p(ArrowDown), p(PageDown), p(ArrowRight), p(Space)]),
+            // 0.2.x: the tabs were Service, Songs, Slide designer, Bible
+            Action::TabDesigner => Some(vec![KeyBinding::ctrl(Num3)]),
+            Action::TabBible => Some(vec![KeyBinding::ctrl(Num4)]),
             _ => None,
         }
     }
@@ -225,6 +233,8 @@ impl Action {
             Action::Save => vec![c(S)],
             Action::SaveAs => vec![KeyBinding::ctrl_shift(S)],
             Action::RenameItem => vec![p(F2)],
+            // works while typing too (Ctrl), e.g. in the bible search or the song text
+            Action::AddToService => vec![c(Enter)],
             Action::VideoPlayPause => vec![p(Space)],
             Action::VideoForward => vec![p(ArrowRight)],
             Action::VideoBack => vec![p(ArrowLeft)],
@@ -245,8 +255,9 @@ impl Action {
             Action::Find => vec![c(F)],
             Action::TabService => vec![c(Num1)],
             Action::TabSongs => vec![c(Num2)],
-            Action::TabDesigner => vec![c(Num3)],
-            Action::TabBible => vec![c(Num4)],
+            // in the order of the tabs (0.2.x: designer Ctrl+3, bible Ctrl+4)
+            Action::TabBible => vec![c(Num3)],
+            Action::TabDesigner => vec![c(Num4)],
             Action::TabSettings => vec![c(Num5)],
             Action::PinPassage => vec![c(D)],
             Action::Undo => vec![c(Z)],
