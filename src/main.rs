@@ -24,6 +24,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod awake;
 mod bible;
 mod cli;
 mod client_app;
@@ -39,6 +40,7 @@ mod render;
 mod screens;
 mod settings;
 mod shortcuts;
+mod song_formats;
 mod start_guard;
 mod storage;
 #[cfg(test)]

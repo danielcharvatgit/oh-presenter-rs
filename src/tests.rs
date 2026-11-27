@@ -96,7 +96,8 @@ fn own_service_format_roundtrip_with_media() {
     let mut song = Song::new();
     song.title = "Píseň".into();
     song.parts.push(SongPart { tag: "C".into(), number: 0, text: "Refrén".into(), translations: Vec::new() });
-    let service = Service { items: vec![ServiceItem::new(ItemKind::Design(design)), ServiceItem::new(ItemKind::Song(song))] };
+    let service =
+        Service { items: vec![ServiceItem::new(ItemKind::Design(design)), ServiceItem::new(ItemKind::Song(song))], ..Default::default() };
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/service.ohsvc");
     formats::save_service(&path, &service).unwrap();
     // remove the media from the store; loading must bring it back
@@ -307,8 +308,9 @@ fn ui_presenting_with_keyboard() {
     // tab switching shortcuts; every tab renders
     for (k, tab) in [
         (Key::Num2, Tab::Songs),
-        (Key::Num3, Tab::Designer),
-        (Key::Num4, Tab::Bible),
+        // 0.3.0: the tabs are Service, Songs, Bible, Slide designer, Settings
+        (Key::Num3, Tab::Bible),
+        (Key::Num4, Tab::Designer),
         (Key::Num5, Tab::Settings),
         (Key::Num1, Tab::Service),
     ] {
@@ -1018,8 +1020,8 @@ fn ui_bible_word_search_index_per_language() {
     h.app.tab = Tab::Settings;
     h.frame(vec![]);
     assert!(h.texts.iter().any(|t| t == "keep above all other windows"));
-    // the bible section is further down the page
-    for _ in 0..10 {
+    // the bible section is further down the page (0.3.0: more display settings above it)
+    for _ in 0..25 {
         if h.texts.iter().any(|t| t.starts_with("index: 1 of 1")) {
             break;
         }
@@ -1810,15 +1812,16 @@ fn ui_tab_key_starts_at_the_open_tab() {
     h.frame(vec![]);
     let id = |h: &Harness, t: Tab| h.app.alt_nav.tab_ids.iter().find(|(x, _)| *x == t).unwrap().1;
     h.frame(key(Key::Tab, Modifiers::NONE));
-    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Settings)), "Tab from Bible goes to Settings");
+    // 0.3.0: the tabs are Service, Songs, Bible, Slide designer, Settings
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Designer)), "Tab from Bible goes to the Slide designer");
     // nothing focused again: Shift+Tab goes back from Bible
-    h.ctx.memory_mut(|m| m.surrender_focus(id(&h, Tab::Settings)));
+    h.ctx.memory_mut(|m| m.surrender_focus(id(&h, Tab::Designer)));
     h.frame(vec![]);
-    for _ in 0..3 {
+    for _ in 0..2 {
         h.frame(key(Key::Tab, Modifiers::SHIFT));
         h.frame(vec![]);
     }
-    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Service)), "3× Shift+Tab from Bible");
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(id(&h, Tab::Service)), "2× Shift+Tab from Bible");
 }
 
 #[test]
@@ -2727,7 +2730,7 @@ fn cli_options_and_help() {
     assert!(o.windowed && o.mcp && o.mcp_port == Some(4000) && o.live_mode == Some(false) && o.slide == Some(3));
     assert!(parse(&a("--mcp-port 0")).is_err());
     let help = crate::cli::help();
-    assert!(help.contains("0.2.0"));
+    assert!(help.contains("0.3.0"));
     for opt in [
         "--cli",
         "--service",
@@ -2747,9 +2750,9 @@ fn cli_options_and_help() {
     for c in crate::remote::COMMANDS {
         assert!(help.contains(c.name), "{}", c.name);
     }
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
     let readme = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md")).unwrap();
-    assert!(readme.contains("Current version: **0.2.0**"));
+    assert!(readme.contains("Current version: **0.3.0**"));
 }
 
 #[test]
@@ -2898,7 +2901,20 @@ fn ui_every_command_works() {
     let n = h.app.service.items.len();
     run(&mut h, &format!("bible add bible={bid} Genesis 1:2")).unwrap();
     assert_eq!(h.app.service.items.len(), n + 1);
+    // add-to-service: the open tab's "Add to service" (Ctrl+Enter)
+    assert!(run(&mut h, "add-to-service tab=bible").unwrap().contains("Genesis"));
+    assert_eq!((h.app.tab, h.app.service.items.len()), (crate::app::Tab::Bible, n + 2));
+    assert!(h.app.quick.is_some(), "the quick passage of bible show");
+    run(&mut h, "add-to-service tab=service").unwrap();
+    assert_eq!((h.app.service.items.len(), h.app.quick.is_none()), (n + 3, true), "the quick passage is added");
+    assert!(run(&mut h, "add-to-service").is_err(), "no quick passage any more");
+    h.app.tab = crate::app::Tab::Settings;
+    assert!(run(&mut h, "add-to-service").is_err(), "nothing to add in Settings");
+    assert!(run(&mut h, "add-to-service tab=settings").is_err(), "not a tab with Add to service");
+    h.app.service.items.truncate(n + 1);
     assert!(run(&mut h, "bible search bible=nosuchbible x").is_err());
+    assert!(run(&mut h, "list-bible-books").unwrap().contains("Genesis"));
+    run(&mut h, "set-background service clear=true").unwrap();
     let status = run(&mut h, "status").unwrap();
     assert!(status.contains("live:") && status.contains("output window: closed"), "{status}");
     let settings = run(&mut h, "get-settings").unwrap();
@@ -2935,7 +2951,8 @@ fn ui_every_command_works() {
     assert!(dir.join("over.ohsvc").exists(), "saved as .ohsvc");
     // every command was run here, or in the video test below
     for c in crate::remote::COMMANDS {
-        assert!(done.contains(c.name) || ["playback-control", "add-video"].contains(&c.name), "{} untested", c.name);
+        // (bible-item: in bible_item_controls, with bibles of two languages)
+        assert!(done.contains(c.name) || ["playback-control", "add-video", "bible-item"].contains(&c.name), "{} untested", c.name);
     }
     assert!(h.app.run_command("fly", &Default::default(), &h.ctx.clone()).is_err());
     // a question open for the operator: commands that change things wait for it; an error
@@ -2965,7 +2982,10 @@ fn ui_cli_plan_plays_the_video_looped() {
         v.title = "video".into();
         v.media = "video.mp4".into();
     }
-    let service = Service { items: vec![ServiceItem::new(ItemKind::Text { title: "Welcome".into(), text: "hi".into() }), video] };
+    let service = Service {
+        items: vec![ServiceItem::new(ItemKind::Text { title: "Welcome".into(), text: "hi".into() }), video],
+        ..Default::default()
+    };
     formats::save_service(&file, &service).unwrap();
     let args: Vec<String> = ["--cli", "--service", &file.to_string_lossy(), "--service-item", "video.mp4", "--playback-control=play-loop"]
         .iter()
@@ -3144,7 +3164,7 @@ fn ui_mcp_server_answers_like_the_buttons() {
     assert_eq!(init.0, 200);
     let init = json(&init.1);
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.2.0");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.3.0");
     assert!(init["result"]["capabilities"]["tools"].is_object());
     assert_eq!(note.0, 202);
     let list = json(&list.1);
@@ -3182,4 +3202,952 @@ fn ui_mcp_server_answers_like_the_buttons() {
     h.frame_with(tall());
     assert!(h.texts.iter().any(|t| t == &crate::i18n::t("settings.mcp_enabled")));
     assert!(h.texts.iter().any(|t| t == &crate::i18n::t("settings.advanced")));
+}
+
+// ---------------------------------------------------------------------------
+// 0.3.0: tab order, bible filter and item controls, backgrounds, text layout, keys in the
+// output window, keep awake
+
+#[test]
+fn tabs_bible_before_designer_and_old_keys_migrate() {
+    use crate::shortcuts::{Action, KeyBinding};
+    use eframe::egui::Key;
+    assert_eq!(Action::TabBible.defaults(), vec![KeyBinding::ctrl(Key::Num3)]);
+    assert_eq!(Action::TabDesigner.defaults(), vec![KeyBinding::ctrl(Key::Num4)]);
+    let all = Action::ALL;
+    let pos = |a| all.iter().position(|x| *x == a).unwrap();
+    assert!(pos(Action::TabBible) < pos(Action::TabDesigner), "Settings › Keyboard shortcuts lists them in the tabs' order");
+    // settings of 0.2.x with the old default keys get the new ones
+    let mut s = crate::settings::Settings::default();
+    s.shortcuts.map.insert(Action::TabDesigner, vec![KeyBinding::ctrl(Key::Num3)]);
+    s.shortcuts.map.insert(Action::TabBible, vec![KeyBinding::ctrl(Key::Num4)]);
+    s.upgrade_shortcuts();
+    assert_eq!(s.shortcuts.bindings(Action::TabBible), vec![KeyBinding::ctrl(Key::Num3)]);
+    assert_eq!(s.shortcuts.bindings(Action::TabDesigner), vec![KeyBinding::ctrl(Key::Num4)]);
+    // keys the user chose stay
+    s.shortcuts.map.insert(Action::TabBible, vec![KeyBinding::ctrl(Key::B)]);
+    s.upgrade_shortcuts();
+    assert_eq!(s.shortcuts.bindings(Action::TabBible), vec![KeyBinding::ctrl(Key::B)]);
+    // the tab bar shows Bible before the Slide designer
+    let h = Harness::new();
+    let at = |name: &str| h.texts.iter().position(|t| t.starts_with(name)).unwrap_or_else(|| panic!("{name}: {:?}", h.texts));
+    assert!(at("Songs") < at("Bible") && at("Bible") < at("Slide designer") && at("Slide designer") < at("Settings"));
+}
+
+#[test]
+fn new_defaults() {
+    let s = crate::settings::Settings::default();
+    assert!(s.output_always_on_top, "keep above all other windows: on by default");
+    assert!(s.prevent_sleep);
+    assert_eq!(s.bible_reference, ReferenceParts { book: true, chapter: true, verse: true, translation: true });
+    assert_eq!(Song::new().column_layout, ColumnLayout::Stacked);
+    assert_eq!(App::blank_song_layout(), ColumnLayout::Stacked);
+    let st = TextStyle::default();
+    assert_eq!(
+        (st.text_valign, st.text_halign, st.footer_position, st.footer_align),
+        (VAlign::Middle, HAlign::Center, FooterPosition::BelowText, HAlign::Center)
+    );
+    assert!(st.footer_size < st.max_font_size, "the reference is smaller than the text");
+    // settings saved by 0.2.0 (no new fields) load, keeping what they had
+    let old = r#"{"text_style":{"background":[0,0,0,255],"color":[255,255,255,255],"max_font_size":50.0,"footer_size":20.0,"show_footer":false,"shadow":true},"verses_per_slide":2}"#;
+    let s: crate::settings::Settings = serde_json::from_str(old).unwrap();
+    assert_eq!(
+        (s.text_style.max_font_size, s.text_style.footer_size, s.text_style.show_footer, s.verses_per_slide),
+        (50.0, 20.0, false, 2)
+    );
+    assert_eq!(s.text_style.text_valign, VAlign::Middle);
+    assert_eq!(s.text_style.margin, 40.0);
+    assert!(s.prevent_sleep && s.bible_reference.book);
+    // the alert's background is "Text background" now
+    let en = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lang/en.lang")).unwrap();
+    let cs = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lang/cs.lang")).unwrap();
+    assert!(en.contains("settings.alert_background = Text background") && !en.contains("Strip under the text"));
+    assert!(cs.contains("settings.alert_background = Pozadí textu"));
+}
+
+use crate::app::App;
+
+impl App {
+    fn blank_song_layout() -> ColumnLayout {
+        App::blank_song().column_layout
+    }
+}
+
+#[test]
+fn verse_references_with_chosen_parts() {
+    let all = ReferenceParts::default();
+    assert_eq!(verse_reference("John", (3, 16), (3, 16), &all, ":"), "John 3:16");
+    assert_eq!(verse_reference("John", (3, 16), (3, 18), &all, ":"), "John 3:16-18");
+    assert_eq!(verse_reference("Jan", (3, 36), (4, 2), &all, ","), "Jan 3,36-4,2");
+    let no_book = ReferenceParts { book: false, ..all };
+    assert_eq!(verse_reference("John", (3, 16), (3, 16), &no_book, ":"), "3:16");
+    let book_only = ReferenceParts { chapter: false, verse: false, ..all };
+    assert_eq!(verse_reference("John", (3, 16), (3, 17), &book_only, ":"), "John");
+    let chapter = ReferenceParts { verse: false, ..all };
+    assert_eq!(verse_reference("John", (3, 16), (3, 17), &chapter, ":"), "John 3");
+    let verse = ReferenceParts { book: false, chapter: false, ..all };
+    assert_eq!(verse_reference("John", (3, 16), (3, 17), &verse, ":"), "16-17");
+}
+
+/// Text shapes (with their position and size) and whether a line was drawn, for a text slide.
+fn draw_text_slide(scene: &TextScene) -> (Vec<(String, eframe::egui::Rect)>, bool) {
+    use eframe::egui;
+    let ctx = egui::Context::default();
+    crate::render::install_fonts(&ctx, None);
+    let mut texts = Vec::new();
+    let mut lines = false;
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let painter = ui.painter().clone();
+                let mut tex = crate::render::TextureCache::new(PathBuf::from("/nonexistent"));
+                crate::render::draw_text_scene(
+                    &painter,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)),
+                    scene,
+                    &mut tex,
+                );
+            },
+        );
+        out.textures_delta.clear();
+        texts.clear();
+        lines = false;
+        fn walk(s: &egui::Shape, texts: &mut Vec<(String, egui::Rect)>, lines: &mut bool) {
+            match s {
+                // the text's rows (with their line spacing), not only the ink
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::LineSegment { .. } => *lines = true,
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, texts, lines)),
+                _ => {}
+            }
+        }
+        for s in &out.shapes {
+            walk(&s.shape, &mut texts, &mut lines);
+        }
+    }
+    (texts, lines)
+}
+
+#[test]
+fn stacked_columns_have_one_empty_line_between_and_the_reference_below() {
+    let style = TextStyle { shadow: false, ..Default::default() };
+    let scene = TextScene {
+        text: "verse from column one".into(),
+        extra: vec!["verse from column two".into()],
+        layout: ColumnLayout::Stacked,
+        footer: "John 3:16".into(),
+        style: style.clone(),
+        background: None,
+    };
+    let (texts, lines) = draw_text_slide(&scene);
+    assert!(!lines, "no divider between stacked columns");
+    let get = |name: &str| texts.iter().find(|(t, _)| t == name).unwrap_or_else(|| panic!("{name}: {texts:?}")).1;
+    let (one, two, reference) = (get("verse from column one"), get("verse from column two"), get("John 3:16"));
+    // the second column one empty line below the first (a line is about the text's height)
+    let gap = two.top() - one.bottom();
+    assert!(gap > one.height() * 0.85 && gap < one.height() * 1.15, "gap {gap}, line {}", one.height());
+    // the reference below them, an empty line between, centered, smaller
+    let gap2 = reference.top() - two.bottom();
+    assert!(gap2 > one.height() * 0.85 && gap2 < one.height() * 1.15, "gap {gap2}");
+    assert!((reference.center().x - 960.0).abs() < 4.0 && (one.center().x - 960.0).abs() < 4.0);
+    assert!(reference.height() < one.height());
+    // the whole block in the middle of the slide
+    let middle = (one.top() + reference.bottom()) / 2.0;
+    assert!((middle - 540.0).abs() < 30.0, "{middle}");
+    // side by side: a divider; top position: the text starts at the margin
+    let side = TextScene { layout: ColumnLayout::SideBySide, ..scene.clone() };
+    assert!(draw_text_slide(&side).1);
+    let top = TextScene { style: TextStyle { text_valign: VAlign::Top, text_halign: HAlign::Left, ..style.clone() }, ..scene.clone() };
+    let (texts, _) = draw_text_slide(&top);
+    let one = texts.iter().find(|(t, _)| t == "verse from column one").unwrap().1;
+    // the margin: 40 points of the 1280 wide canvas = 60 px here
+    assert!((one.top() - 60.0).abs() < 4.0 && (one.left() - 60.0).abs() < 4.0, "{one:?}");
+    // the reference at the bottom edge
+    let bottom = TextScene { style: TextStyle { footer_position: FooterPosition::Bottom, ..style }, ..scene };
+    let (texts, _) = draw_text_slide(&bottom);
+    let r = texts.iter().find(|(t, _)| t == "John 3:16").unwrap().1;
+    assert!((r.bottom() - (1080.0 - 60.0)).abs() < 4.0, "{r:?}");
+}
+
+/// Two small bibles in English and Czech (and a second English one), saved into the test library.
+fn bible_pair(h: &mut Harness) -> (crate::bible::Bible, crate::bible::Bible, crate::bible::Bible) {
+    for b in crate::bible::list_bibles().iter().filter(|b| b.name.starts_with("Pair ")) {
+        crate::bible::Bible::delete(&b.id);
+    }
+    let en = test_bible(
+        "Pair EN",
+        &[
+            "In the beginning God created the heaven and the earth.",
+            "And the earth was without form, and void; and darkness was upon the face of the deep.",
+            "And God said, Let there be light: and there was light.",
+        ],
+    );
+    let en2 = test_bible(
+        "Pair EN Two",
+        &[
+            "At the start God made the sky and the land and the light.",
+            "The earth was empty and the darkness was over the deep water and the light.",
+            "God said, let there be light, and the light was there and it was good.",
+        ],
+    );
+    let cs = test_bible(
+        "Pair CS",
+        &[
+            "Na počátku stvořil Bůh nebe a zemi.",
+            "Země pak byla nesličná a pustá, a tma byla nad propastí, a Duch Boží vznášel se nad vodami.",
+            "I řekl Bůh: Buď světlo! I bylo světlo. Jak je to dobré.",
+        ],
+    );
+    assert_eq!((en.meta.language.as_str(), en2.meta.language.as_str(), cs.meta.language.as_str()), ("en", "en", "cs"));
+    h.app.bible.bibles = crate::bible::list_bibles();
+    h.app.bible.current = Some(en.clone());
+    h.app.bible_cache.clear();
+    (en, en2, cs)
+}
+
+#[test]
+fn bible_word_search_filter_by_testament_and_book() {
+    use crate::bible::{SearchFilter, SearchIndex, Testament};
+    let mut h = Harness::new();
+    let (en, ..) = bible_pair(&mut h);
+    let idx = SearchIndex::build(&en);
+    let number = |hit: &crate::bible::Hit| en.books[hit.book].number;
+    let search = |f: SearchFilter, limit: usize| idx.search_where("light", limit, |x| f.accepts(number(x)));
+    // "light": verse 3 of Genesis 1, Genesis 2 and James 1 (book 59)
+    assert_eq!(search(SearchFilter::default(), 500).len(), 3);
+    let old = search(SearchFilter { testament: Testament::Old, book: None }, 500);
+    assert!(old.len() == 2 && old.iter().all(|x| number(x) <= 39), "{old:?}");
+    let new = search(SearchFilter { testament: Testament::New, book: None }, 500);
+    assert!(new.len() == 1 && new.iter().all(|x| number(x) >= 40), "{new:?}");
+    // the filter comes before the cap: one NT verse although two OT verses come first
+    assert_eq!(search(SearchFilter { testament: Testament::New, book: None }, 1).len(), 1);
+    let book = search(SearchFilter { testament: Testament::All, book: Some(1) }, 500);
+    assert!(book.len() == 2 && book.iter().all(|x| number(x) == 1));
+    assert_eq!(Testament::parse("NT"), Some(Testament::New));
+    assert_eq!(Testament::parse("x"), None);
+    assert!(Testament::Old.contains(70), "deuterocanonical books count as the Old Testament");
+
+    // the Bible tab and the commands
+    h.app.settings.bible_index_languages = vec!["en".into(), "cs".into()];
+    h.app.build_missing_indexes(true);
+    for _ in 0..500 {
+        h.frame(vec![]);
+        if h.app.bible.indexing.is_none() {
+            break;
+        }
+    }
+    h.app.tab = crate::app::Tab::Bible;
+    h.app.bible.query = "light".into();
+    h.app.run_bible_search();
+    assert_eq!(h.app.bible.results.len(), 3, "{}", h.app.bible.info);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == "Old Testament") && h.texts.iter().any(|t| t == "All books"), "{:?}", h.texts);
+    let found = cmd(&mut h, "bible search testament=new light").unwrap();
+    assert_eq!(found.lines().count(), 1, "{found}");
+    assert!(found.starts_with("James 1:3"), "{found}");
+    assert_eq!(h.app.bible.filter.testament, Testament::New, "stays set, as in the tab");
+    let found = cmd(&mut h, "bible search testament=all book=Genesis limit=1 light").unwrap();
+    assert!(found.starts_with("Genesis 1:3") && found.contains("2 verses found, 1 listed"), "{found}");
+    assert!(cmd(&mut h, "bible search book=Nosuchbook light").is_err());
+    let found = cmd(&mut h, "bible search book=all John 3:16").unwrap();
+    assert!(h.app.bible.filter.book.is_none());
+    let _ = found;
+    let books = cmd(&mut h, "list-bible-books testament=new").unwrap();
+    assert!(books.contains("James") && !books.contains("Genesis"), "{books}");
+    // the help says what the options take
+    let help = crate::remote::help_text();
+    assert!(help.contains("[testament=all|old|new]") && help.contains("[book]") && help.contains("[limit]"), "{help}");
+}
+
+#[test]
+fn command_lines_with_optional_options_before_the_text() {
+    use crate::remote::parse_line;
+    let (n, a) = parse_line("bible search John 3:16").unwrap();
+    assert_eq!((n.as_str(), a["action"].as_str(), a["query"].as_str()), ("bible", Some("search"), Some("John 3:16")));
+    let (_, a) = parse_line("bible search testament=new love one another").unwrap();
+    assert_eq!((a["testament"].as_str(), a["query"].as_str()), (Some("new"), Some("love one another")));
+    let (_, a) = parse_line("bible search old man").unwrap();
+    assert_eq!(a["query"].as_str(), Some("old man"), "a word is never taken for an option without its name");
+    let (_, a) = parse_line("bible-item 3 16").unwrap();
+    assert_eq!((a["chapter"].as_i64(), a["verse"].as_i64()), (Some(3), Some(16)));
+    let (_, a) = parse_line("set-background item /tmp/a b.png").unwrap();
+    assert_eq!(a["file"].as_str(), Some("/tmp/a b.png"));
+    let (_, a) = parse_line("set-background service clear=true").unwrap();
+    assert_eq!(a["clear"].as_bool(), Some(true));
+}
+
+#[test]
+fn bible_item_controls() {
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let (en, en2, cs) = bible_pair(&mut h);
+    h.app.tab = crate::app::Tab::Service;
+    h.app.bible.query = "Genesis 1:1-2".into();
+    h.app.run_bible_search();
+    let p = h.app.bible_selected_passage().unwrap();
+    assert_eq!((p.bible.as_str(), p.verses[0].book_number), (en.meta.id.as_str(), 1));
+    h.app.add_to_service(ItemKind::Bible(p));
+    let r = ItemRef::Service(0);
+    h.app.service_dirty = false;
+    h.app.select(r, 0);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // the controls of diagram.odg
+    for label in ["Bible translation", "Languages", "Book", "Chapter", "English", "Čeština"] {
+        assert!(h.texts.iter().any(|t| t == label), "{label}: {:?}", h.texts);
+    }
+    // the chapter's text in one language (English, the item's): its three verses
+    assert!(h.texts.iter().any(|t| t.contains("Let there be light")), "{:?}", h.texts);
+    assert!(!h.texts.iter().any(|t| t.contains("Buď světlo")), "only one language in the verse list");
+    // Czech on: the item gets the Czech texts, shown one below the English
+    assert!(h.app.bible_item_language(r, "cs", true));
+    assert!(h.app.service_dirty);
+    let ItemKind::Bible(p) = &h.app.service.items[0].kind else { panic!() };
+    assert_eq!(p.extra_bibles, vec![cs.meta.id.clone()]);
+    assert_eq!(p.verses[0].extra, vec!["Na počátku stvořil Bůh nebe a zemi.".to_string()]);
+    let Scene::Text(live) = &h.app.live else { panic!("{:?}", h.app.live) };
+    assert_eq!(live.text, "In the beginning God created the heaven and the earth.");
+    assert_eq!(live.extra, vec!["Na počátku stvořil Bůh nebe a zemi.".to_string()]);
+    assert_eq!(live.layout, ColumnLayout::Stacked);
+    assert!(live.footer.starts_with("Genesis 1:1"), "{}", live.footer);
+    // focusing Czech shows the Czech verse list
+    h.app.bible_nav.focus_lang = Some("cs".into());
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t.contains("Buď světlo")), "{:?}", h.texts);
+    assert!(!h.texts.iter().any(|t| t.contains("Let there be light")));
+    // another English translation replaces the English one
+    assert!(h.app.bible_item_translation(r, &en2.meta.id));
+    let ItemKind::Bible(p) = &h.app.service.items[0].kind else { panic!() };
+    assert_eq!(p.shown_bibles(), vec![en2.meta.id.clone(), cs.meta.id.clone()]);
+    assert!(p.verses[0].text.starts_with("At the start"));
+    assert!(h.app.bible_item_translation(r, &en.meta.id));
+
+    // a verse outside the passage goes live, the item stays as it is
+    let before = h.app.service.items[0].clone();
+    h.app.service_dirty = false;
+    assert!(h.app.bible_item_show_verse(r, 1, 2, 1));
+    assert_eq!(h.app.service.items[0], before);
+    assert!(!h.app.service_dirty);
+    assert_eq!(h.app.live_pos, None);
+    let Scene::Text(live) = &h.app.live else { panic!() };
+    assert_eq!(
+        (live.text.as_str(), live.extra[0].as_str()),
+        ("In the beginning God created the heaven and the earth.", "Na počátku stvořil Bůh nebe a zemi.")
+    );
+    assert!(live.footer.starts_with("Genesis 2:1"), "{}", live.footer);
+    // the slide keys go on through the book
+    h.press(eframe::egui::Key::ArrowDown);
+    let Scene::Text(live) = &h.app.live else { panic!() };
+    assert!(live.footer.starts_with("Genesis 2:2"), "{}", live.footer);
+    h.press(eframe::egui::Key::ArrowUp);
+    h.press(eframe::egui::Key::ArrowUp);
+    let Scene::Text(live) = &h.app.live else { panic!() };
+    assert!(live.footer.starts_with("Genesis 1:3"), "{}", live.footer);
+    // a verse of the passage selects its slide
+    assert!(h.app.bible_item_show_verse(r, 1, 1, 2));
+    assert_eq!((h.app.sel_slide, h.app.live_pos), (1, Some((r, 1))));
+    assert_eq!(h.app.service.items[0], before);
+    // without its translation on, the reference shows no "(…)"
+    h.app.settings.bible_reference.translation = false;
+    let slides = h.app.slides_of(r);
+    let Scene::Text(t) = &slides[0].scene else { panic!() };
+    assert_eq!(t.footer, "Genesis 1:1");
+    h.app.settings.bible_reference.translation = true;
+    let Scene::Text(t) = &h.app.slides_of(r)[0].scene else { panic!() };
+    assert_eq!(t.footer, format!("Genesis 1:1 ({} / {})", en.meta.abbrev, cs.meta.abbrev));
+
+    // the same over the command line / MCP
+    let out = cmd(&mut h, "bible-item").unwrap();
+    assert!(out.contains("shown:") && out.contains(&en.meta.abbrev), "{out}");
+    cmd(&mut h, "bible-item 2 3").unwrap();
+    let Scene::Text(live) = &h.app.live else { panic!() };
+    assert!(live.footer.starts_with("Genesis 2:3"));
+    cmd(&mut h, "bible-item language=cs show=off").unwrap();
+    let ItemKind::Bible(p) = &h.app.service.items[0].kind else { panic!() };
+    assert!(p.extra_bibles.is_empty() && p.verses[0].extra.is_empty());
+    assert!(cmd(&mut h, "bible-item language=en show=off").is_err(), "the only language stays");
+    cmd(&mut h, &format!("bible-item translation='{}'", cs.meta.name)).unwrap();
+    let ItemKind::Bible(p) = &h.app.service.items[0].kind else { panic!() };
+    assert_eq!(p.extra_bibles, vec![cs.meta.id.clone()]);
+    assert!(cmd(&mut h, "bible-item 9 9").is_err());
+
+    // saved and opened again: the translations are in the file
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/bible-item.ohsvc");
+    formats::save_service(&file, &h.app.service).unwrap();
+    let back = formats::load_service(&file).unwrap();
+    assert_eq!(back.items[0].kind, h.app.service.items[0].kind);
+
+    // an item of an older file: no bible id, no book numbers, found by abbreviation and book name
+    let old = Passage {
+        reference: "Genesis 1:3".into(),
+        version: en.meta.abbrev.clone(),
+        verses: vec![PassageVerse { book: "Genesis".into(), chapter: 1, verse: 3, text: "old text".into(), ..Default::default() }],
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&old).unwrap();
+    assert!(!json.contains("extra") && !json.contains("book_number"), "{json}");
+    h.app.service.items.push(ServiceItem::new(ItemKind::Bible(old)));
+    let r2 = ItemRef::Service(1);
+    h.app.select(r2, 0);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == "Bible translation"), "the controls work for it too");
+    assert!(h.app.bible_item_show_verse(r2, 1, 2, 2));
+    // a passage whose bible is not installed shows its slides as before
+    let gone = Passage {
+        reference: "X 1:1".into(),
+        version: "NOPE".into(),
+        verses: vec![PassageVerse { book: "X".into(), chapter: 1, verse: 1, text: "kept text".into(), ..Default::default() }],
+        ..Default::default()
+    };
+    h.app.service.items.push(ServiceItem::new(ItemKind::Bible(gone)));
+    h.app.select(ItemRef::Service(2), 0);
+    h.frame(vec![]);
+    assert!(!h.texts.iter().any(|t| t == "Bible translation"));
+    let Scene::Text(t) = &h.app.live else { panic!() };
+    assert_eq!(t.text, "kept text");
+    for b in [en, en2, cs] {
+        crate::bible::Bible::delete(&b.meta.id);
+    }
+}
+
+#[test]
+fn background_pictures_of_service_and_items() {
+    use crate::app::backgrounds::BackgroundTarget;
+    let mut h = Harness::new();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-home/backgrounds");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, w: u32, h: u32, shade: u8| {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([shade, 0, 0, 255]));
+        let p = dir.join(name);
+        img.save(&p).unwrap();
+        p
+    };
+    let service_pic = App::background_picture(&write("service.png", 32, 18, 10)).unwrap();
+    let item_pic = App::background_picture(&write("item.png", 10, 20, 200)).unwrap();
+    assert_eq!((item_pic.width, item_pic.height), (10, 20));
+    // a tall picture covers the slide: as wide as the slide, cut at the top and bottom
+    let o = item_pic.object();
+    assert!((o.w - CANVAS_W).abs() < 0.5 && o.h > CANVAS_H && o.y < 0.0, "{o:?}");
+
+    let text = |t: &str| ServiceItem::new(ItemKind::Text { title: t.into(), text: "x".into() });
+    let overlay = ServiceItem::new(ItemKind::Design(formats::full_screen_image("overlay", "o.png".into(), &png_bytes(0))));
+    let opaque = ServiceItem::new(ItemKind::Design(formats::full_screen_image("photo", "p.png".into(), &png_bytes(255))));
+    h.app.service.items = vec![text("a"), text("b"), overlay, opaque];
+    let ids: Vec<String> = h.app.service.items.iter().map(|i| i.id.clone()).collect();
+    h.app.set_background(&BackgroundTarget::Service, Some(service_pic.clone())).unwrap();
+    h.app.set_background(&BackgroundTarget::Item(ids[1].clone()), Some(item_pic.clone())).unwrap();
+    h.app.set_background(&BackgroundTarget::Item(ids[2].clone()), Some(item_pic.clone())).unwrap();
+    h.app.set_background(&BackgroundTarget::Item(ids[3].clone()), Some(item_pic.clone())).unwrap();
+    assert!(h.app.service_dirty);
+    let bg_media = |app: &App, r: usize| -> Vec<String> {
+        match &app.slides_of(crate::app::ItemRef::Service(r))[0].scene {
+            Scene::Text(t) => t.background.iter().flat_map(|d| d.media().map(String::from)).collect(),
+            Scene::Canvas(d) => d.media().map(String::from).collect(),
+            _ => vec![],
+        }
+    };
+    assert_eq!(bg_media(&h.app, 0), vec![service_pic.media.clone()], "the service's picture under a text");
+    assert_eq!(bg_media(&h.app, 1), vec![item_pic.media.clone()], "the item's own picture instead");
+    assert_eq!(
+        bg_media(&h.app, 2),
+        vec![item_pic.media.clone(), "o.png".to_string()],
+        "under a transparent picture: the item's picture first"
+    );
+    assert_eq!(bg_media(&h.app, 3), vec!["p.png".to_string()], "an opaque picture covers everything: nothing added");
+    h.app.set_background(&BackgroundTarget::Item(ids[2].clone()), None).unwrap();
+    assert_eq!(bg_media(&h.app, 2), vec!["o.png".to_string()], "the service's picture never goes under a transparent picture");
+    // the live slide shows a new picture right away
+    h.app.select(crate::app::ItemRef::Service(0), 0);
+    h.app.go_live();
+    h.app.set_background(&BackgroundTarget::Service, None).unwrap();
+    let Scene::Text(t) = &h.app.live else { panic!() };
+    assert!(t.background.as_ref().is_none_or(|d| d.media().next().is_none()));
+    h.app.set_background(&BackgroundTarget::Service, Some(service_pic.clone())).unwrap();
+    // saved with the service: the pictures go into the file and come back
+    let file = dir.join("bg.ohsvc");
+    formats::save_service(&file, &h.app.service).unwrap();
+    let zip = zip::ZipArchive::new(std::fs::File::open(&file).unwrap()).unwrap();
+    let names: Vec<String> = zip.file_names().filter_map(|n| n.ok()).map(String::from).collect();
+    assert!(names.contains(&format!("media/{}", service_pic.media)) && names.contains(&format!("media/{}", item_pic.media)), "{names:?}");
+    let back = formats::load_service(&file).unwrap();
+    assert_eq!(back.background, Some(service_pic.clone()));
+    assert_eq!(back.items[1].background, Some(item_pic.clone()));
+    // older service files (no pictures) load
+    let old: Service = serde_json::from_str(r#"{"items":[]}"#).unwrap();
+    assert!(old.background.is_none());
+    // the Service tab offers it; the commands do the same
+    h.app.tab = crate::app::Tab::Service;
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == "Service background:") && h.texts.iter().any(|t| t == "Item background:"), "{:?}", h.texts);
+    let pic = dir.join("item.png");
+    cmd(&mut h, &format!("set-background item '{}'", pic.display())).unwrap();
+    assert!(h.app.service.items[0].background.is_some());
+    cmd(&mut h, "set-background item clear=true").unwrap();
+    assert!(h.app.service.items[0].background.is_none());
+    cmd(&mut h, "set-background service clear=true").unwrap();
+    assert!(h.app.service.background.is_none());
+    assert!(cmd(&mut h, "set-background service /no/such.png").is_err());
+    assert!(cmd(&mut h, "set-background service").is_err());
+}
+
+#[test]
+fn keys_pressed_in_the_output_window_work_as_in_the_main_window() {
+    use crate::app::Tab;
+    use eframe::egui::{Key, Modifiers};
+    let mut h = Harness::new();
+    // --cli: the root window is the output window, so these keys reach only the output
+    h.app.cli = true;
+    h.app.output_open = true;
+    h.frame(vec![]);
+    h.frame(key(Key::Num3, Modifiers::COMMAND));
+    h.frame(vec![]);
+    assert_eq!(h.app.tab, Tab::Bible, "Ctrl+3 in the output switches the main window's tab");
+    h.frame(key(Key::Num4, Modifiers::COMMAND));
+    h.frame(vec![]);
+    assert_eq!(h.app.tab, Tab::Designer);
+    // the keys of a text field (search) stay with the main window
+    h.frame(key(Key::F, Modifiers::COMMAND));
+    h.frame(vec![]);
+    assert_eq!(h.app.tab, Tab::Designer);
+    // the slide keys work from any tab, as before
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "t".into(), text: "one\n---\ntwo".into() }));
+    h.press(Key::ArrowDown);
+    h.frame(vec![]);
+    assert_eq!(h.app.sel_item, Some(crate::app::ItemRef::Service(0)));
+    h.frame(key(Key::Period, Modifiers::NONE));
+    h.frame(vec![]);
+    assert!(h.app.blank);
+}
+
+#[test]
+fn keep_awake_is_off_in_tests_but_the_setting_exists() {
+    // the inhibitor talks to the desktop: never started by tests; the setting is offered
+    let mut h = Harness::new();
+    h.app.tab = crate::app::Tab::Settings;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == "Keep the computer awake while the program runs"), "{:?}", h.texts);
+    assert_eq!(crate::awake::PORTAL_FLAGS, 12, "idle + suspend");
+    for label in ["Text position", "Additional info position", "Below the text", "Bible reference shows"] {
+        assert!(h.texts.iter().any(|t| t == label), "{label}");
+    }
+}
+
+#[test]
+fn slide_keys_after_something_else_went_live_do_not_bring_back_a_bible_verse() {
+    // a verse outside the passage was live; then a design goes live (Slide designer, Show
+    // live): ↓ is about what is live now, not the verse shown before it
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let (en, en2, cs) = bible_pair(&mut h);
+    h.app.tab = crate::app::Tab::Service;
+    h.app.bible.query = "Genesis 1:1-2".into();
+    h.app.run_bible_search();
+    let p = h.app.bible_selected_passage().unwrap();
+    h.app.add_to_service(ItemKind::Bible(p));
+    let r = ItemRef::Service(0);
+    h.app.select(r, 0);
+    h.frame(vec![]);
+    assert!(h.app.bible_item_show_verse(r, 1, 2, 1));
+    assert!(h.app.bible_outside_live().is_some());
+    h.app.set_live(Scene::Canvas(CanvasDoc::default()), None);
+    assert!(h.app.bible_outside_live().is_none(), "the verse is no longer live");
+    h.press(eframe::egui::Key::ArrowDown);
+    if let Scene::Text(live) = &h.app.live {
+        assert!(!live.footer.starts_with("Genesis 2:2"), "the old verse's neighbour came back: {}", live.footer);
+    }
+    for b in [en, en2, cs] {
+        crate::bible::Bible::delete(&b.meta.id);
+    }
+}
+
+#[test]
+fn a_bible_verse_that_was_live_and_is_replaced_is_not_stepped_from() {
+    // as slide_keys_after_something_else…, but the check does not depend on the scene kind
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let (en, en2, cs) = bible_pair(&mut h);
+    h.app.tab = crate::app::Tab::Service;
+    h.app.bible.query = "Genesis 1:1-2".into();
+    h.app.run_bible_search();
+    let p = h.app.bible_selected_passage().unwrap();
+    h.app.add_to_service(ItemKind::Bible(p));
+    let r = ItemRef::Service(0);
+    h.app.select(r, 0);
+    h.frame(vec![]);
+    assert!(h.app.bible_item_show_verse(r, 1, 2, 1));
+    h.app.set_live(Scene::Canvas(CanvasDoc::default()), None);
+    h.press(eframe::egui::Key::ArrowDown);
+    match &h.app.live {
+        Scene::Text(live) => assert!(!live.footer.starts_with("Genesis 2:"), "{}", live.footer),
+        other => panic!("↓ goes on in the selected item (a text slide), not {other:?}"),
+    }
+    for b in [en, en2, cs] {
+        crate::bible::Bible::delete(&b.meta.id);
+    }
+}
+
+#[test]
+fn a_new_background_picture_keeps_blank_and_the_playing_video() {
+    use crate::app::backgrounds::BackgroundTarget;
+    let mut h = Harness::new();
+    let pic = BackgroundPicture { media: "none.png".into(), width: 10, height: 10 };
+    // a text slide live, the output blanked: a picture changes it, the output stays black
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "t".into(), text: "one".into() }));
+    h.app.select(crate::app::ItemRef::Service(0), 0);
+    h.app.go_live();
+    h.app.blank = true;
+    h.app.set_background(&BackgroundTarget::Service, Some(pic.clone())).unwrap();
+    assert!(h.app.blank, "blank stays on");
+    assert_eq!(h.app.output_scene(), Scene::Blank);
+    let Scene::Text(t) = &h.app.live else { panic!() };
+    assert!(t.background.is_some(), "the live slide has the picture (shown when blank is off)");
+    // a playing video is not started again
+    h.app.blank = false;
+    let v = Video { title: "v".into(), media: "none.mp4".into(), poster: None, duration: 60.0, looped: false, muted: true };
+    h.app.set_live(Scene::Video(VideoScene::new(&v)), None);
+    let before = h.app.live.clone();
+    h.app.set_background(&BackgroundTarget::Service, None).unwrap();
+    assert_eq!(h.app.live, before, "the video goes on");
+}
+
+#[test]
+fn a_shown_language_changed_while_blanked_stays_blanked() {
+    use crate::app::ItemRef;
+    let mut h = Harness::new();
+    let (en, en2, cs) = bible_pair(&mut h);
+    h.app.tab = crate::app::Tab::Service;
+    h.app.bible.query = "Genesis 1:1-2".into();
+    h.app.run_bible_search();
+    let p = h.app.bible_selected_passage().unwrap();
+    h.app.add_to_service(ItemKind::Bible(p));
+    let r = ItemRef::Service(0);
+    h.app.select(r, 0);
+    h.app.go_live();
+    h.app.blank = true;
+    assert!(h.app.bible_item_language(r, "cs", true));
+    assert!(h.app.blank, "blank stays on");
+    let Scene::Text(live) = &h.app.live else { panic!() };
+    assert_eq!(live.extra.len(), 1, "the live slide has the new language");
+    // the same with a verse outside the passage live
+    h.app.blank = false;
+    assert!(h.app.bible_item_show_verse(r, 1, 2, 1));
+    h.app.blank = true;
+    assert!(h.app.bible_item_language(r, "cs", false));
+    assert!(h.app.blank, "blank stays on (outside verse)");
+    assert!(h.app.bible_outside_live().is_some(), "the outside verse is still the live one");
+    for b in [en, en2, cs] {
+        crate::bible::Bible::delete(&b.meta.id);
+    }
+}
+
+#[test]
+fn bible_command_filter_without_a_query_filters_the_last_word_search() {
+    let mut h = Harness::new();
+    let (en, en2, cs) = bible_pair(&mut h);
+    h.app.settings.bible_index_languages = vec!["en".into(), "cs".into()];
+    h.app.build_missing_indexes(true);
+    for _ in 0..500 {
+        h.frame(vec![]);
+        if h.app.bible.indexing.is_none() {
+            break;
+        }
+    }
+    // "light": verse 3 of Genesis 1, Genesis 2 and James 1
+    let all = cmd(&mut h, "bible search light").unwrap();
+    assert!(all.contains("James 1:3") && all.contains("Genesis"), "{all}");
+    let new = cmd(&mut h, "bible search testament=new").unwrap();
+    assert!(!new.contains("Genesis"), "the filter applies to the last search: {new}");
+    assert!(!new.trim().is_empty());
+    cmd(&mut h, "bible search testament=all").unwrap();
+    for b in [en, en2, cs] {
+        crate::bible::Bible::delete(&b.meta.id);
+    }
+}
+
+#[test]
+fn output_window_keys_wait_while_the_main_window_has_a_dialog_open() {
+    // (--cli drops every dialog at once, so this checks which keys the output window passes on)
+    use crate::app::Dialog;
+    use crate::shortcuts::Action;
+    let mut h = Harness::new();
+    assert!(h.app.output_action_enabled(Action::TabSongs));
+    assert!(h.app.output_action_enabled(Action::Alert));
+    h.app.dialog = Some(Dialog::Message("hello".into()));
+    assert!(!h.app.output_action_enabled(Action::TabSongs), "Ctrl+2 waits as in the main window");
+    assert!(!h.app.output_action_enabled(Action::Alert), "F7 waits too");
+    assert!(h.app.output_action_enabled(Action::NextSlide), "the slide keys still work, as before");
+    assert!(h.app.output_action_enabled(Action::ToggleOutput));
+    h.app.dialog = None;
+    assert!(h.app.output_action_enabled(Action::TabSongs));
+}
+
+// ---------------------------------------------------------------------------
+// Service tab: the columns keep the widths the operator chose (0.3.0 fix of the live column
+// that took the whole right side or closed by itself).
+
+/// Widths (left, right) of the Service tab's columns as egui stores them.
+fn service_widths(h: &Harness) -> (f32, f32) {
+    use eframe::egui::containers::panel::PanelState;
+    let (left, right) = h.app.service_panel_ids().expect("the Service tab was drawn");
+    let w = |id| PanelState::load(&h.ctx, id).expect("the panel id is egui's").outer_rect.width();
+    (w(left), w(right))
+}
+
+fn sized_frame(h: &mut Harness, w: f32, ht: f32, events: Vec<eframe::egui::Event>) {
+    let rect = eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(w, ht));
+    h.frame_with(eframe::egui::RawInput { events, screen_rect: Some(rect), ..Default::default() });
+}
+
+fn service_with_long_title() -> Harness {
+    use crate::app::Tab;
+    let mut h = Harness::new();
+    let spaced = "Very long title of the item ".repeat(22);
+    let solid = "X".repeat(600);
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: spaced[..600].to_string(), text: "one\n---\ntwo".into() }));
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: solid, text: "three".into() }));
+    h.app.tab = Tab::Service;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h
+}
+
+#[test]
+fn ui_service_long_live_title_keeps_column_widths() {
+    use eframe::egui::Key;
+    let mut h = Harness::new();
+    h.app.tab = crate::app::Tab::Service;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let (l0, r0) = service_widths(&h);
+    drop(h); // one harness at a time (they share a lock)
+    let mut h = service_with_long_title();
+    assert_eq!(service_widths(&h), (l0, r0), "a fresh service has the default widths");
+    // live mode: Down selects and shows the first item (spaced title), later the second (one word)
+    h.press(Key::ArrowDown);
+    assert!(matches!(h.app.live_pos, Some((crate::app::ItemRef::Service(0), _))), "the long title is live");
+    for i in 0..40 {
+        if i == 20 {
+            h.press(Key::ArrowDown);
+            h.press(Key::ArrowDown);
+            assert!(matches!(h.app.live_pos, Some((crate::app::ItemRef::Service(1), _))), "the one-word title is live");
+        }
+        h.frame(vec![]);
+        let (l, r) = service_widths(&h);
+        assert!((l - l0).abs() < 1.5, "frame {i}: the items column changed {l0} -> {l}");
+        assert!((r - r0).abs() < 1.5, "frame {i}: the live column changed {r0} -> {r}");
+        assert!(1400.0 - l - r >= 200.0, "frame {i}: the slides column keeps >= 200 px ({})", 1400.0 - l - r);
+    }
+}
+
+#[test]
+fn ui_service_columns_come_back_after_a_small_window() {
+    let mut h = service_with_long_title();
+    h.press(eframe::egui::Key::ArrowDown);
+    h.frame(vec![]);
+    let (l0, r0) = service_widths(&h);
+    for _ in 0..5 {
+        sized_frame(&mut h, 300.0, 900.0, vec![]);
+    }
+    for _ in 0..3 {
+        sized_frame(&mut h, 0.0, 0.0, vec![]);
+    }
+    for _ in 0..3 {
+        sized_frame(&mut h, 1400.0, 900.0, vec![]);
+    }
+    let (l, r) = service_widths(&h);
+    assert!((l - l0).abs() < 1.5, "items column {l0} -> {l}");
+    assert!((r - r0).abs() < 1.5, "live column {r0} -> {r}");
+}
+
+#[test]
+fn ui_service_narrow_window_shows_all_three_columns() {
+    let mut h = service_with_long_title();
+    h.press(eframe::egui::Key::ArrowDown);
+    for _ in 0..5 {
+        sized_frame(&mut h, 800.0, 600.0, vec![]);
+        let (l, r) = service_widths(&h);
+        assert!(l >= 96.0 && r >= 96.0, "both side columns visible: {l} / {r}");
+        assert!(800.0 - l - r >= 199.0, "the slides column keeps >= 200 px: {}", 800.0 - l - r);
+    }
+}
+
+#[test]
+fn ui_service_live_border_drags_with_the_mouse() {
+    use eframe::egui::{Event, Modifiers, PointerButton, pos2};
+    let mut h = service_with_long_title();
+    h.press(eframe::egui::Key::ArrowDown);
+    h.frame(vec![]);
+    let (_, r0) = service_widths(&h);
+    // on the border itself (the tab has a margin, so it is not at 1400 - r0)
+    let (_, right) = h.app.service_panel_ids().unwrap();
+    let x = h.ctx.read_response(right.with("__resize")).expect("the border of the live column").rect.center().x;
+    let y = 450.0;
+    let button =
+        |x: f32, pressed| Event::PointerButton { pos: pos2(x, y), button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(vec![Event::PointerMoved(pos2(x, y))]);
+    h.frame(vec![button(x, true)]);
+    for step in 1..=10 {
+        h.frame(vec![Event::PointerMoved(pos2(x - 10.0 * step as f32, y))]);
+    }
+    h.frame(vec![button(x - 100.0, false)]);
+    h.frame(vec![Event::PointerGone]);
+    let (_, r) = service_widths(&h);
+    assert!((r - (r0 + 100.0)).abs() < 3.0, "dragged {r0} -> {r}");
+    for _ in 0..10 {
+        h.frame(vec![]);
+    }
+    let (_, r2) = service_widths(&h);
+    assert!((r2 - r).abs() < 1.5, "the dragged width stays: {r} -> {r2}");
+}
+
+#[test]
+fn ui_alt_numbers_follow_the_bar_from_left_to_right() {
+    use crate::app::Tab;
+    use crate::app::keynav::{BarItem, bar_items, chosen};
+    use eframe::egui::{Event, Key, Modifiers};
+    let items = bar_items();
+    let expected = [
+        BarItem::Menu(0),
+        BarItem::Menu(1),
+        BarItem::Tab(Tab::Service),
+        BarItem::Tab(Tab::Songs),
+        BarItem::Tab(Tab::Bible),
+        BarItem::Tab(Tab::Designer),
+        BarItem::Tab(Tab::Settings),
+    ];
+    for (n, want) in expected.iter().enumerate() {
+        assert_eq!(chosen(&(n + 1).to_string(), &items), Some(*want), "Alt+{}", n + 1);
+    }
+    assert_eq!(chosen("8", &items), None);
+    // in the bar, the labels come in the same order
+    let h = Harness::new();
+    let at = |name: &str| h.texts.iter().position(|t| t.starts_with(name)).unwrap_or_else(|| panic!("{name}: {:?}", h.texts));
+    let order: Vec<usize> = items.iter().map(|(label, _)| at(label)).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // (one harness at a time: it holds the tests' lock)
+    drop(h);
+    // Alt+5 in the program: the 5th item from the left, the Bible tab; Alt+6 the designer
+    let mut h = Harness::new();
+    for (k, tab) in [(Key::Num5, Tab::Bible), (Key::Num6, Tab::Designer), (Key::Num7, Tab::Settings), (Key::Num3, Tab::Service)] {
+        h.frame(vec![Event::ModifiersChanged(Modifiers::ALT)]);
+        h.frame(key(k, Modifiers::ALT));
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+        h.frame(vec![]);
+        assert_eq!(h.app.tab, tab, "{k:?}");
+    }
+}
+
+#[test]
+fn ui_ctrl_enter_adds_to_service() {
+    use crate::app::{ItemRef, Tab};
+    use crate::shortcuts::{Action, KeyBinding};
+    use eframe::egui::{Key, Modifiers};
+    let d = crate::shortcuts::Shortcuts::default();
+    assert_eq!(d.bindings(Action::AddToService), vec![KeyBinding::ctrl(Key::Enter)]);
+    assert!(d.conflicts(&KeyBinding::ctrl(Key::Enter), Action::AddToService).is_empty(), "no other action has Ctrl+Enter");
+    let mut h = Harness::new();
+    // Songs: the open song
+    h.app.tab = Tab::Songs;
+    h.app.songs.song = sample_song();
+    h.frame(vec![]);
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!(h.app.service.items.len(), 1);
+    assert!(matches!(&h.app.service.items[0].kind, ItemKind::Song(s) if s.title == "Test song"));
+    // Bible: the found verses
+    let b = test_bible("CtrlEnterBible", &["In the beginning God created the heaven and the earth.", "And the earth was without form."]);
+    h.app.bible.bibles.push(b.meta.clone());
+    h.app.bible.current = Some(b);
+    h.app.tab = Tab::Bible;
+    h.app.bible.query = "Genesis 1:2".into();
+    h.app.run_bible_search();
+    h.frame(vec![]);
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!(h.app.service.items.len(), 2);
+    assert!(matches!(&h.app.service.items[1].kind, ItemKind::Bible(p) if p.reference.contains('2')));
+    // Service: the quick passage; without one Ctrl+Enter does nothing
+    cmd(&mut h, "bible show").unwrap();
+    assert!(h.app.quick.is_some());
+    h.app.tab = Tab::Service;
+    h.frame(vec![]);
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!((h.app.service.items.len(), h.app.quick.is_none()), (3, true));
+    assert_ne!(h.app.sel_item, Some(ItemRef::Quick));
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!(h.app.service.items.len(), 3);
+    // Slide designer: the open design
+    h.app.tab = Tab::Designer;
+    h.frame(vec![]);
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!(h.app.service.items.len(), 4);
+    assert!(h.app.service.items.iter().any(|i| matches!(i.kind, ItemKind::Design(_))));
+    // Settings: nothing
+    h.app.tab = Tab::Settings;
+    h.frame(vec![]);
+    h.frame(key(Key::Enter, Modifiers::COMMAND));
+    assert_eq!(h.app.service.items.len(), 4);
+    // listed in Settings › Keyboard shortcuts (its grid shows every action of Action::ALL,
+    // named in both languages)
+    assert!(Action::ALL.contains(&Action::AddToService));
+    assert!(crate::i18n::t(&Action::AddToService.label_key()).starts_with("Add to service ("));
+    crate::i18n::set_language("cs");
+    assert!(crate::i18n::t(&Action::AddToService.label_key()).starts_with("Přidat do shromáždění ("));
+    crate::i18n::set_language("en");
+}
+
+#[test]
+fn bible_and_song_references_have_their_own_options() {
+    use crate::settings::Settings;
+    let s = Settings::default();
+    assert!(s.show_bible_reference && s.text_style.show_footer);
+    // settings of 0.3.0 had one option for both: the bible keeps what it said
+    let old = br#"{"text_style":{"background":[0,0,0,255],"color":[255,255,255,255],"max_font_size":50.0,"footer_size":20.0,"show_footer":false,"shadow":true}}"#;
+    let s = Settings::from_json(old).unwrap();
+    assert!(!s.show_bible_reference && !s.text_style.show_footer);
+    let new = br#"{"text_style":{"background":[0,0,0,255],"color":[255,255,255,255],"max_font_size":50.0,"footer_size":20.0,"show_footer":false,"shadow":true},"show_bible_reference":true}"#;
+    let s = Settings::from_json(new).unwrap();
+    assert!(s.show_bible_reference && !s.text_style.show_footer);
+    assert!(Settings::from_json(b"not json").is_none());
+
+    let mut h = Harness::new();
+    let b = test_bible("RefBible", &["In the beginning God created the heaven and the earth."]);
+    h.app.bible.current = Some(b);
+    h.app.bible.query = "Genesis 1:1".into();
+    h.app.run_bible_search();
+    let p = h.app.bible_selected_passage().unwrap();
+    h.app.service.items.push(ServiceItem::new(ItemKind::Bible(p)));
+    h.app.service.items.push(ServiceItem::new(ItemKind::Song(sample_song())));
+    h.app.service.items.push(ServiceItem::new(ItemKind::Text { title: "News".into(), text: "one".into() }));
+    let shown = |h: &Harness| -> Vec<bool> {
+        h.app
+            .service
+            .items
+            .iter()
+            .map(|i| match &h.app.item_slides(i)[0].scene {
+                Scene::Text(t) => t.style.show_footer,
+                _ => panic!(),
+            })
+            .collect()
+    };
+    assert_eq!(shown(&h), vec![true, true, true]);
+    h.app.settings.show_bible_reference = false;
+    assert_eq!(shown(&h), vec![false, true, true], "only the bible's reference is gone");
+    h.app.settings.show_bible_reference = true;
+    h.app.settings.text_style.show_footer = false;
+    assert_eq!(shown(&h), vec![true, false, false], "songs and texts lose their title, the bible keeps its reference");
+    // the settings page has both options, and set-setting changes the bible's
+    h.app.tab = crate::app::Tab::Settings;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.texts.iter().any(|t| t == "Bible: show the reference"), "{:?}", h.texts);
+    assert!(h.texts.iter().any(|t| t == "Songs and texts: show the title"));
+    let ctx = h.ctx.clone();
+    let args = crate::remote::parse_line("set-setting show_bible_reference false").unwrap().1;
+    h.app.run_command("set-setting", &args, &ctx).unwrap();
+    assert!(!h.app.settings.show_bible_reference);
 }

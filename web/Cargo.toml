@@ -1,0 +1,38 @@
+[package]
+name = "oh-presenter-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "oh! Presenter for the web browser: an offline PWA (Rust + WebAssembly)"
+
+# The web edition shares the program's data model, bible import / search and song formats
+# (../src/model.rs, ../src/bible.rs, ../src/song_formats.rs, see src/main.rs), so services,
+# songs and bibles behave the same and .ohsvc files open in both.
+
+[features]
+# never on: the shared ../src/bible.rs reads OpenLP databases (SQLite) only in the program
+sqlite = []
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+roxmltree = "0.21"
+# .ohsvc services are zip files; pure Rust deflate (no C in the browser)
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+js-sys = "0.3"
+# the same version as the wasm-bindgen command (build.sh)
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Storage", "Document", "Element", "HtmlCanvasElement", "Location", "Navigator", "console"] }
+
+# outside the browser only the tests run (cargo test): winit needs a window system there
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

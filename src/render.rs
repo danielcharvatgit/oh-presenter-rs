@@ -2,8 +2,8 @@
 //! Shared by previews, the output window and network canvas clients.
 
 use crate::model::{
-    Alert, AlertDirection, AlertFont, CANVAS_H, CANVAS_W, CanvasDoc, ColumnLayout, FontStyle, HAlign, ObjectKind, Scene, TextScene, VAlign,
-    VideoScene,
+    Alert, AlertDirection, AlertFont, CANVAS_H, CANVAS_W, CanvasDoc, ColumnLayout, FontStyle, FooterPosition, HAlign, ObjectKind, Scene,
+    TextScene, VAlign, VideoScene,
 };
 use eframe::egui::{self, Align, Color32, FontFamily, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, TextureHandle, Vec2};
 use std::collections::HashMap;
@@ -285,78 +285,113 @@ pub fn draw_text_scene(painter: &Painter, rect: Rect, t: &TextScene, tex: &mut T
         }
     }
     let s = rect.width() / CANVAS_W;
-    let margin = 40.0 * s;
+    let st = &t.style;
+    let margin = st.margin.clamp(0.0, 400.0) * s;
     let mut area = rect.shrink(margin);
-    let color = t.style.color.to_color32();
+    let color = st.color.to_color32();
     let family = FontFamily::Name(OUTPUT_FONT.into());
-
-    if t.style.show_footer && !t.footer.is_empty() {
-        let fg = layout(painter, &t.footer, FontId::new(t.style.footer_size * s, family.clone()), color, area.width(), HAlign::Left);
-        let pos = Pos2::new(area.left(), area.bottom() - fg.size().y);
-        if t.style.shadow {
-            painter.galley_with_override_text_color(pos + Vec2::splat(2.0 * s), fg.clone(), Color32::from_black_alpha(200));
+    let shadow = |pos: Pos2, g: &std::sync::Arc<egui::Galley>, off: f32| {
+        if st.shadow {
+            painter.galley_with_override_text_color(pos + Vec2::splat(off * s), g.clone(), Color32::from_black_alpha(200));
         }
-        painter.galley(pos, fg.clone(), color);
-        area.max.y -= fg.size().y + 10.0 * s;
-    }
+    };
+    let x_of = |a: Rect, align: HAlign| match align {
+        HAlign::Left => a.left(),
+        HAlign::Center => a.center().x,
+        HAlign::Right => a.right(),
+    };
 
-    // one area per column (other languages next to or below the main text)
-    let texts: Vec<&str> = std::iter::once(t.text.as_str()).chain(t.extra.iter().map(String::as_str)).collect();
-    let n = texts.len() as f32;
-    let gap = 30.0 * s;
-    let areas: Vec<Rect> = (0..texts.len())
-        .map(|i| {
-            let i = i as f32;
-            match t.layout {
-                ColumnLayout::SideBySide => {
-                    let w = (area.width() - gap * (n - 1.0)) / n;
-                    Rect::from_min_size(Pos2::new(area.left() + i * (w + gap), area.top()), Vec2::new(w, area.height()))
-                }
-                ColumnLayout::Stacked => {
-                    let h = (area.height() - gap * (n - 1.0)) / n;
-                    Rect::from_min_size(Pos2::new(area.left(), area.top() + i * (h + gap)), Vec2::new(area.width(), h))
-                }
+    // the additional info (reference, song title): at an edge, or right below the text
+    let footer = (st.show_footer && !t.footer.trim().is_empty()).then(|| {
+        layout(painter, &t.footer, FontId::new((st.footer_size * s).max(1.0), family.clone()), color, area.width(), st.footer_align)
+    });
+    let footer_gap = 10.0 * s;
+    if let Some(fg) = &footer {
+        match st.footer_position {
+            FooterPosition::Top => {
+                let pos = Pos2::new(x_of(area, st.footer_align), area.top());
+                shadow(pos, fg, 2.0);
+                painter.galley(pos, fg.clone(), color);
+                area.min.y += fg.size().y + footer_gap;
             }
-        })
-        .collect();
+            FooterPosition::Bottom => {
+                let pos = Pos2::new(x_of(area, st.footer_align), area.bottom() - fg.size().y);
+                shadow(pos, fg, 2.0);
+                painter.galley(pos, fg.clone(), color);
+                area.max.y -= fg.size().y + footer_gap;
+            }
+            FooterPosition::BelowText => {}
+        }
+    }
+    let below = footer.as_ref().filter(|_| st.footer_position == FooterPosition::BelowText);
 
-    // shrink the font until every column fits; all columns share one size
-    let mut size = t.style.max_font_size * s;
+    // the columns (other languages) next to each other, or one below the other with an
+    // empty line between them
+    let texts: Vec<&str> =
+        std::iter::once(t.text.as_str()).chain(t.extra.iter().map(String::as_str)).filter(|x| !x.trim().is_empty()).collect();
+    let texts = if texts.is_empty() { vec![t.text.as_str()] } else { texts };
+    let n = texts.len() as f32;
+    let col_gap = 30.0 * s;
+    let side = t.layout == ColumnLayout::SideBySide && texts.len() > 1;
+    let col_w = if side { (area.width() - col_gap * (n - 1.0)) / n } else { area.width() };
+
+    // shrink the font until everything fits; all columns share one size
+    let mut size = st.max_font_size * s;
     let min = 8.0 * s;
-    let galleys = loop {
-        let gs: Vec<_> = texts
-            .iter()
-            .zip(&areas)
-            .map(|(text, a)| layout(painter, text, FontId::new(size, family.clone()), color, a.width(), HAlign::Center))
-            .collect();
-        let fits = gs.iter().zip(&areas).all(|(g, a)| g.size().y <= a.height() && g.size().x <= a.width() + 1.0);
+    let (galleys, line, height) = loop {
+        let font = FontId::new(size.max(1.0), family.clone());
+        let gs: Vec<_> = texts.iter().map(|text| layout(painter, text, font.clone(), color, col_w, st.text_halign)).collect();
+        // one empty line of the text's size
+        let line = painter.layout_no_wrap("Ag".into(), font, color).size().y;
+        let text_h = if side {
+            gs.iter().map(|g| g.size().y).fold(0.0, f32::max)
+        } else {
+            gs.iter().map(|g| g.size().y).sum::<f32>() + line * (n - 1.0)
+        };
+        let height = text_h + below.map(|f| line + f.size().y).unwrap_or(0.0);
+        let fits = height <= area.height() && gs.iter().all(|g| g.size().x <= col_w + 1.0);
         if fits || size <= min {
-            break gs;
+            break (gs, line, height);
         }
         size *= 0.92;
     };
-    if texts.len() > 1 {
-        // a thin divider between the columns
-        let stroke = Stroke::new(1.5 * s, color.gamma_multiply(0.35));
-        for a in &areas[1..] {
-            match t.layout {
-                ColumnLayout::SideBySide => {
-                    let x = a.left() - gap / 2.0;
-                    painter.line_segment([Pos2::new(x, area.top() + 20.0 * s), Pos2::new(x, area.bottom() - 20.0 * s)], stroke);
-                }
-                ColumnLayout::Stacked => {
-                    let y = a.top() - gap / 2.0;
-                    painter.line_segment([Pos2::new(area.left() + 80.0 * s, y), Pos2::new(area.right() - 80.0 * s, y)], stroke);
-                }
+    let top = match st.text_valign {
+        VAlign::Top => area.top(),
+        VAlign::Middle => area.center().y - height / 2.0,
+        VAlign::Bottom => area.bottom() - height,
+    };
+    let mut y = top;
+    if side {
+        let mut text_h: f32 = 0.0;
+        for (i, g) in galleys.iter().enumerate() {
+            let a = Rect::from_min_size(Pos2::new(area.left() + i as f32 * (col_w + col_gap), top), Vec2::new(col_w, area.height()));
+            let pos = Pos2::new(x_of(a, st.text_halign), top);
+            shadow(pos, g, 3.0);
+            painter.galley(pos, g.clone(), color);
+            text_h = text_h.max(g.size().y);
+            if i > 0 {
+                // a thin divider between the columns
+                let x = a.left() - col_gap / 2.0;
+                let stroke = Stroke::new(1.5 * s, color.gamma_multiply(0.35));
+                painter.line_segment([Pos2::new(x, top), Pos2::new(x, top + text_h.max(g.size().y))], stroke);
             }
         }
-    }
-    for (galley, a) in galleys.into_iter().zip(&areas) {
-        let pos = Pos2::new(a.center().x, a.center().y - galley.size().y / 2.0);
-        if t.style.shadow {
-            painter.galley_with_override_text_color(pos + Vec2::splat(3.0 * s), galley.clone(), Color32::from_black_alpha(200));
+        y += text_h;
+    } else {
+        for (i, g) in galleys.iter().enumerate() {
+            if i > 0 {
+                y += line;
+            }
+            let pos = Pos2::new(x_of(area, st.text_halign), y);
+            shadow(pos, g, 3.0);
+            painter.galley(pos, g.clone(), color);
+            y += g.size().y;
         }
-        painter.galley(pos, galley, color);
+    }
+    if let Some(fg) = below {
+        let pos = Pos2::new(x_of(area, st.footer_align), y + line);
+        shadow(pos, fg, 2.0);
+        painter.galley(pos, fg.clone(), color);
     }
 }
 

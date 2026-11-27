@@ -97,6 +97,8 @@ pub enum Purpose {
     DesignerAddImage,
     /// Replace the picture of the image object with this id.
     DesignerReplaceImage(String),
+    /// A background picture of the service or of a service item.
+    Background(super::backgrounds::BackgroundTarget),
 }
 
 /// A dialog that is open right now.

@@ -50,7 +50,7 @@ impl App {
             if ui.button(t("designer.save_as_new")).on_hover_text(sc.describe(Action::SaveAs)).clicked() {
                 self.save_design(true, false);
             }
-            if ui.button((super::plus_icon(), t("designer.add_to_service"))).clicked() {
+            if ui.button((super::plus_icon(), t("designer.add_to_service"))).on_hover_text(sc.describe(Action::AddToService)).clicked() {
                 self.add_to_service(ItemKind::Design(self.designer.design.clone()));
             }
             if ui.button(format!("▶ {}", t("designer.show_live"))).on_hover_text(t("designer.show_live_hint")).clicked() {

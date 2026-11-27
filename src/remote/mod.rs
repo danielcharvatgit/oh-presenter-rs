@@ -76,6 +76,11 @@ pub const COMMANDS: &[Spec] = &[
         params: &[p("file", Kind::Text, true, "picture file")],
     },
     Spec { name: "add-video", help: "Add a video (copied into the library)", params: &[p("file", Kind::Text, true, "video file")] },
+    Spec {
+        name: "add-to-service",
+        help: "Add to service of the open tab (Ctrl+Enter, the tab's Add to service button): Songs the open song, Bible the selected verses (all found when none is selected), Slide designer the open design, Service the quick passage",
+        params: &[p("tab", Kind::OneOf(&["service", "songs", "bible", "designer"]), false, "open this tab first (as show-tab)")],
+    },
     Spec { name: "list-items", help: "The items of the service (number, title, kind; * = selected, LIVE = live)", params: &[] },
     Spec {
         name: "select-item",
@@ -125,22 +130,63 @@ pub const COMMANDS: &[Spec] = &[
     },
     Spec { name: "alert", help: "Alert: a message running across the output", params: &[p("text", Kind::Text, true, "the message")] },
     Spec { name: "stop-alert", help: "Stop the alert", params: &[] },
+    Spec {
+        name: "set-background",
+        help: "Background picture of the service (under every text slide) or of the selected item (under its text and its pictures with transparency)",
+        params: &[
+            p("scope", Kind::OneOf(&["item", "service"]), true, "item (the selected one) / service"),
+            p("clear", Kind::Bool, false, "remove the picture"),
+            p("file", Kind::Text, false, "picture file"),
+        ],
+    },
     // Other tabs
     Spec {
         name: "show-tab",
         help: "Show a tab of the program",
-        params: &[p("tab", Kind::OneOf(&["service", "songs", "bible", "settings"]), true, "the tab")],
+        params: &[p("tab", Kind::OneOf(&["service", "songs", "bible", "designer", "settings"]), true, "the tab")],
     },
     Spec { name: "list-songs", help: "Songs of the library", params: &[p("search", Kind::Text, false, "only titles containing this")] },
     Spec { name: "list-designs", help: "Designs of the library", params: &[] },
     Spec { name: "list-bibles", help: "Bibles (id, name; * = current)", params: &[] },
     Spec {
+        name: "list-bible-books",
+        help: "Books of a bible (number, name, chapters)",
+        params: &[
+            p("bible", Kind::Text, false, "bible id, name or abbreviation (default: the current one)"),
+            p("testament", Kind::OneOf(&["all", "old", "new"]), false, "only the Old / New Testament"),
+        ],
+    },
+    Spec {
         name: "bible",
-        help: "Bible: search (reference like \"John 3:16\" or words) or show (live the found verses, as Show live)",
+        help: "Bible tab: search (a reference like \"John 3:16\" / \"Jan 3,16-18\", or words), show (the found verses live, as Show live) or add (to the service, after the selected item). Word search can be limited to a testament and / or a book",
         params: &[
             p("action", Kind::OneOf(&["search", "show", "add"]), true, "search / show / add (to the service)"),
-            p("bible", Kind::Text, false, "bible id or name (default: the current one)"),
-            p("query", Kind::Text, false, "reference or words (search)"),
+            p("bible", Kind::Text, false, "bible id, name or abbreviation (default: the current one)"),
+            p(
+                "testament",
+                Kind::OneOf(&["all", "old", "new"]),
+                false,
+                "word search only in the Old / New Testament (stays set, as in the Bible tab)",
+            ),
+            p("book", Kind::Text, false, "word search only in this book (name or abbreviation; \"all\" = every book; stays set)"),
+            p("limit", Kind::Int, false, "search: how many verses to list (default 50, at most 500)"),
+            p("query", Kind::Text, false, "reference or words"),
+        ],
+    },
+    Spec {
+        name: "bible-item",
+        help: "The selected bible item of the service (Service tab): translations / languages shown on the output, and any verse of its book shown live. Without parameters: what it shows",
+        params: &[
+            p("chapter", Kind::Int, false, "chapter of the passage's book (with verse=: shown live)"),
+            p("verse", Kind::Int, false, "verse to show live (in chapter=, default the chapter shown now)"),
+            p(
+                "translation",
+                Kind::Text,
+                false,
+                "show this translation (id, name or abbreviation): replaces the one of its language, or adds its language",
+            ),
+            p("language", Kind::Text, false, "a language code (en, cs, …) to turn on or off (with show=)"),
+            p("show", ON_OFF, false, "with language=: on = shown on the output, off = not"),
         ],
     },
     // State and settings
@@ -232,7 +278,11 @@ pub fn parse_line(line: &str) -> Result<(String, Map<String, Value>), String> {
     let Some((name, rest)) = words.split_first() else { return Err("empty command".into()) };
     let spec = spec(name).ok_or_else(|| format!("unknown command {name:?} (help lists them)"))?;
     let last = spec.params.last().map(|p| p.name);
-    let positional: Vec<&Param> = spec.params.iter().filter(|p| p.required || Some(p.name) == last || p.kind != Kind::Text).collect();
+    // a last text parameter takes the rest of the line: the optional ones before it are
+    // only given by name (`bible search John 3:16`, `bible search testament=new love`)
+    let last_takes_rest = spec.params.last().is_some_and(|p| p.kind == Kind::Text);
+    let positional: Vec<&Param> =
+        spec.params.iter().filter(|p| p.required || Some(p.name) == last || (p.kind != Kind::Text && !last_takes_rest)).collect();
     let mut args = Map::new();
     let mut rest = rest.iter();
     while let Some(w) = rest.next() {
@@ -298,8 +348,18 @@ pub fn input_schema(spec: &Spec) -> Value {
 pub fn help_text() -> String {
     let mut out = String::new();
     for s in COMMANDS {
-        let params: Vec<String> =
-            s.params.iter().map(|p| if p.required { format!("<{}>", p.name) } else { format!("[{}]", p.name) }).collect();
+        let params: Vec<String> = s
+            .params
+            .iter()
+            .map(|p| {
+                // the values a parameter takes, when it is one of some words
+                let name = match p.kind {
+                    Kind::OneOf(words) if !p.required => format!("{}={}", p.name, words.join("|")),
+                    _ => p.name.to_string(),
+                };
+                if p.required { format!("<{name}>") } else { format!("[{name}]") }
+            })
+            .collect();
         out.push_str(&format!("  {:<18} {:<26} {}\n", s.name, params.join(" "), s.help));
     }
     out.push_str(

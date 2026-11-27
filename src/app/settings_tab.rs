@@ -1,6 +1,6 @@
 use super::{App, WriteKind};
 use crate::i18n::{t, tf};
-use crate::model::Rgba;
+use crate::model::{FooterPosition, HAlign, Rgba, VAlign};
 use crate::settings::SlideMark;
 use crate::shortcuts::{Action, Shortcuts, capture_key};
 use crate::storage::paths;
@@ -21,6 +21,15 @@ fn color_row(ui: &mut egui::Ui, label: &str, c: &mut Rgba) -> bool {
         *c = Rgba::from_color32(c32);
     }
     ui.end_row();
+    changed
+}
+
+/// Left / center / right.
+fn halign_buttons(ui: &mut egui::Ui, a: &mut HAlign) -> bool {
+    let mut changed = false;
+    for (v, key) in [(HAlign::Left, "settings.left"), (HAlign::Center, "settings.center"), (HAlign::Right, "settings.right")] {
+        changed |= ui.selectable_value(a, v, t(key)).changed();
+    }
     changed
 }
 
@@ -156,6 +165,12 @@ impl App {
             ui.label(t("service.live_mode"));
             changed |= ui.checkbox(&mut self.settings.live_follows_selection, t("service.live_mode_hint")).changed();
             ui.end_row();
+            ui.label(t("settings.computer"));
+            changed |= ui
+                .checkbox(&mut self.settings.prevent_sleep, t("settings.prevent_sleep"))
+                .on_hover_text(t("settings.prevent_sleep_hint"))
+                .changed();
+            ui.end_row();
         });
         changed
     }
@@ -169,13 +184,62 @@ impl App {
             changed |= color_row(ui, &t("settings.text_color"), &mut style.color);
             changed |= color_row(ui, &t("settings.bg_color"), &mut style.background);
             ui.label(t("settings.max_font"));
-            changed |= ui.add(egui::Slider::new(&mut style.max_font_size, 16.0..=160.0)).changed();
+            changed |=
+                ui.add(egui::Slider::new(&mut style.max_font_size, 16.0..=160.0)).on_hover_text(t("settings.max_font_hint")).changed();
             ui.end_row();
-            ui.label(t("settings.footer_size"));
-            changed |= ui.add(egui::Slider::new(&mut style.footer_size, 8.0..=60.0)).changed();
+            ui.label(t("settings.text_position"));
+            ui.horizontal_wrapped(|ui| {
+                for (v, key) in [(VAlign::Top, "settings.top"), (VAlign::Middle, "settings.middle"), (VAlign::Bottom, "settings.bottom")] {
+                    changed |= ui.selectable_value(&mut style.text_valign, v, t(key)).changed();
+                }
+                ui.separator();
+                changed |= halign_buttons(ui, &mut style.text_halign);
+            });
+            ui.end_row();
+            ui.label(t("settings.margin"));
+            changed |= ui.add(egui::Slider::new(&mut style.margin, 0.0..=300.0)).on_hover_text(t("settings.margin_hint")).changed();
             ui.end_row();
             ui.label(t("settings.footer"));
-            changed |= ui.checkbox(&mut style.show_footer, t("settings.show_footer")).changed();
+            ui.vertical(|ui| {
+                changed |= ui
+                    .checkbox(&mut self.settings.show_bible_reference, t("settings.show_bible_reference"))
+                    .on_hover_text(t("settings.show_bible_reference_hint"))
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut style.show_footer, t("settings.show_song_footer"))
+                    .on_hover_text(t("settings.show_song_footer_hint"))
+                    .changed();
+            });
+            ui.end_row();
+            let any_footer = style.show_footer || self.settings.show_bible_reference;
+            ui.label(t("settings.footer_size"));
+            changed |= ui.add_enabled(any_footer, egui::Slider::new(&mut style.footer_size, 8.0..=96.0)).changed();
+            ui.end_row();
+            ui.label(t("settings.footer_position"));
+            ui.add_enabled_ui(any_footer, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (v, key) in [
+                        (FooterPosition::BelowText, "settings.footer_below"),
+                        (FooterPosition::Top, "settings.footer_top"),
+                        (FooterPosition::Bottom, "settings.footer_bottom"),
+                    ] {
+                        changed |= ui.selectable_value(&mut style.footer_position, v, t(key)).changed();
+                    }
+                    ui.separator();
+                    changed |= halign_buttons(ui, &mut style.footer_align);
+                });
+            });
+            ui.end_row();
+            ui.label(t("settings.bible_reference"));
+            ui.add_enabled_ui(self.settings.show_bible_reference, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let r = &mut self.settings.bible_reference;
+                    changed |= ui.checkbox(&mut r.book, t("settings.ref_book")).changed();
+                    changed |= ui.checkbox(&mut r.chapter, t("settings.ref_chapter")).changed();
+                    changed |= ui.checkbox(&mut r.verse, t("settings.ref_verse")).changed();
+                    changed |= ui.checkbox(&mut r.translation, t("settings.ref_translation")).changed();
+                });
+            });
             ui.end_row();
             ui.label(t("settings.shadow"));
             changed |= ui.checkbox(&mut style.shadow, t("settings.show_shadow")).changed();
@@ -217,15 +281,13 @@ impl App {
                 .changed();
             ui.end_row();
         });
-        if changed {
+        if changed && matches!(self.live, crate::model::Scene::Text(_)) {
             // the live text slide picks up the new style right away
-            if let Some((item, slide)) = self.live_pos
-                && let Some(s) = self.slides_of(item).get(slide)
-                && matches!(s.scene, crate::model::Scene::Text(_))
-            {
-                self.live = s.scene.clone();
-                self.broadcast();
-            }
+            let (pos, blank) = (self.live_pos, self.blank);
+            self.refresh_live();
+            self.live_pos = pos;
+            self.blank = blank;
+            self.broadcast();
         }
         changed
     }
@@ -488,6 +550,7 @@ impl App {
             }
         });
         ui.weak(t("settings.shortcuts_hint"));
+        ui.weak(t("settings.shortcuts_output"));
         egui::Grid::new("shortcuts").striped(true).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
             for a in Action::ALL {
                 ui.label(t(&a.label_key()));

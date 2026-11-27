@@ -8,6 +8,13 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke, StrokeKind, Vec2};
 /// Height of a row in the service item list (room for a small slide preview).
 const ITEM_ROW_H: f32 = 44.0;
 
+/// Default widths of the items (left) and live (right) column.
+const DEFAULT_WIDTHS: [f32; 2] = [270.0, 380.0];
+/// The narrowest a side column gets (egui's smallest panel).
+const SIDE_MIN: f32 = 96.0;
+/// The slides (middle) column always keeps at least this much.
+const MIDDLE_MIN: f32 = 200.0;
+
 /// The three columns of the Service tab (items, slides, live) as last drawn, for moving
 /// between them and resizing them with the keyboard ([`App::service_column_keys`]).
 pub struct Columns {
@@ -16,6 +23,14 @@ pub struct Columns {
     rects: [egui::Rect; 3],
     /// The first control of each column (gets the focus when moving to the column).
     first: [Option<egui::Id>; 3],
+    /// Widths of the left and right column as the operator chose them (border drag or arrow
+    /// keys); `None` = the default. Only the operator changes them: neither a long text in a
+    /// column nor a small (minimized) window does.
+    chosen: [Option<f32>; 2],
+    /// The widths the columns got in the last frame (the chosen ones fitted into the window).
+    shown: [f32; 2],
+    /// Width of the whole Service tab in the last frame.
+    total: f32,
 }
 
 impl Columns {
@@ -27,13 +42,38 @@ impl Columns {
 
 impl Default for Columns {
     fn default() -> Self {
-        Self { panels: None, rects: [egui::Rect::NOTHING; 3], first: [None; 3] }
+        Self { panels: None, rects: [egui::Rect::NOTHING; 3], first: [None; 3], chosen: [None; 2], shown: DEFAULT_WIDTHS, total: 0.0 }
     }
 }
 
 /// Id of a panel's resize handle (the border), as egui makes it.
 fn border_id(panel: egui::Id) -> egui::Id {
     panel.with("__resize")
+}
+
+/// The widths the side columns are shown with: the chosen ones, both made narrower (in the same
+/// ratio) when the window has no room for them and [`MIDDLE_MIN`] of the slides column.
+fn fit_columns(total: f32, chosen: [f32; 2]) -> [f32; 2] {
+    let room = (total - MIDDLE_MIN).max(0.0);
+    let sum = chosen[0] + chosen[1];
+    if sum > room && sum > 0.0 { chosen.map(|w| w * room / sum) } else { chosen }
+}
+
+/// The width egui gives a panel of size `want`, limited to `max_size`, with `available` room.
+fn panel_width(want: f32, max_size: f32, available: f32) -> f32 {
+    let max = max_size.min(available).max(0.0);
+    want.clamp(SIDE_MIN.min(max), max).min(available)
+}
+
+/// Shows a column's contents without letting them change the column's width: egui would make
+/// the panel as wide as its widest content (a long live title) and keep that as its new size.
+/// The contents are clipped to the column instead.
+fn fixed_width<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = ui.max_rect();
+    // the column is exactly as wide as given, whatever the contents need
+    ui.expand_to_include_rect(rect);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    add(&mut child)
 }
 
 /// The part of the Service tab that was clicked last (where the video keys apply).
@@ -69,9 +109,45 @@ impl App {
         let left_id = ui.scope_id().with_salt(egui::IdSalt::new("service_items"));
         let right_id = ui.scope_id().with_salt(egui::IdSalt::new("service_live"));
         self.service_cols.first = [None; 3];
-        let l = egui::Panel::left("service_items").resizable(true).default_size(270.0).show(ui, |ui| self.service_list(ui));
-        let r = egui::Panel::right("service_live").resizable(true).default_size(380.0).show(ui, |ui| self.live_panel(ui));
+        // egui keeps a panel's width in its PanelState and changes it by itself (to the width of
+        // the contents, or of a small window); the columns get the widths chosen here instead
+        let ctx = ui.ctx().clone();
+        let area = ui.available_rect_before_wrap();
+        let total = area.width();
+        let chosen = [0, 1].map(|i| self.service_cols.chosen[i].unwrap_or(DEFAULT_WIDTHS[i]));
+        let shown = fit_columns(total, chosen);
+        for (id, w) in [(left_id, shown[0]), (right_id, shown[1])] {
+            let outer_rect = egui::Rect::from_min_size(area.min, Vec2::new(w, area.height()));
+            ctx.data_mut(|d| d.insert_persisted(id, egui::containers::panel::PanelState { outer_rect }));
+        }
+        let left_max = (total - shown[1] - MIDDLE_MIN).max(SIDE_MIN);
+        let left_expect = panel_width(shown[0], left_max, total);
+        let l = egui::Panel::left("service_items")
+            .resizable(true)
+            .default_size(DEFAULT_WIDTHS[0])
+            .max_size(left_max)
+            .show(ui, |ui| fixed_width(ui, |ui| self.service_list(ui)));
+        let rest = (total - l.response.rect.width()).max(0.0);
+        let right_max = (rest - MIDDLE_MIN).max(SIDE_MIN);
+        let right_expect = panel_width(shown[1], right_max, rest);
+        let r = egui::Panel::right("service_live")
+            .resizable(true)
+            .default_size(DEFAULT_WIDTHS[1])
+            .max_size(right_max)
+            .show(ui, |ui| fixed_width(ui, |ui| self.live_panel(ui)));
         let c = egui::CentralPanel::default_margins().show(ui, |ui| self.slides_panel(ui));
+        // a stored width other than the one given = the operator moved the border (a mouse drag
+        // or an accessibility tool): that becomes the chosen width
+        for (i, id, expect) in [(0, left_id, left_expect), (1, right_id, right_expect)] {
+            if let Some(state) = egui::containers::panel::PanelState::load(&ctx, id) {
+                let w = state.outer_rect.width();
+                if (w - expect).abs() > 0.5 {
+                    self.service_cols.chosen[i] = Some(w.max(SIDE_MIN));
+                }
+            }
+        }
+        self.service_cols.shown = [l.response.rect.width(), r.response.rect.width()];
+        self.service_cols.total = total;
         self.service_cols.panels = Some((left_id, right_id));
         self.service_cols.rects = [l.response.rect, c.response.rect, r.response.rect];
         // a focused border keeps ← → (egui would move the focus with them)
@@ -126,17 +202,12 @@ impl App {
                     .map(|(m, k, d)| if i.consume_key(m, k) { d } else { 0.0 })
                     .sum::<f32>()
             });
-            if moved != 0.0
-                && let Some(mut state) = egui::containers::panel::PanelState::load(ctx, panel)
-            {
-                let r = &mut state.outer_rect;
+            if moved != 0.0 {
                 // the border moves: the left column gets wider to the right, the right one narrower
-                if panel == left_id {
-                    r.max.x = (r.max.x + moved).max(r.min.x + 96.0);
-                } else {
-                    r.min.x = (r.min.x + moved).min(r.max.x - 96.0);
-                }
-                ctx.data_mut(|d| d.insert_persisted(panel, state));
+                let cols = &mut self.service_cols;
+                let (i, delta) = if panel == left_id { (0, moved) } else { (1, -moved) };
+                let max = (cols.total - cols.shown[1 - i] - MIDDLE_MIN).max(SIDE_MIN);
+                cols.chosen[i] = Some((cols.shown[i] + delta).clamp(SIDE_MIN, max));
                 ctx.request_repaint();
             }
             return;
@@ -189,6 +260,7 @@ impl App {
         });
         ui.separator();
         self.add_menu(ui);
+        self.service_background_options(ui);
         ui.separator();
 
         if let Some(q) = self.quick.clone() {
@@ -197,12 +269,9 @@ impl App {
                 if ui.selectable_label(sel, format!("⚡ {}", q.title())).on_hover_text(t("service.quick_hint")).clicked() {
                     self.select(ItemRef::Quick, 0);
                 }
-                if ui.small_button(super::plus_icon()).on_hover_text(t("service.add_quick")).clicked() {
-                    self.add_to_service(q.kind.clone());
-                    self.quick = None;
-                    if self.sel_item == Some(ItemRef::Quick) {
-                        self.sel_item = None;
-                    }
+                let hint = format!("{}\n{}", t("service.add_quick"), self.settings.shortcuts.describe(Action::AddToService));
+                if ui.small_button(super::plus_icon()).on_hover_text(hint.trim_end()).clicked() {
+                    self.add_quick_to_service();
                 }
             });
             ui.separator();
@@ -266,6 +335,7 @@ impl App {
                         ("service.edit", "edit"),
                         ("service.rename", "rename"),
                         ("service.duplicate", "dup"),
+                        ("background.item_menu", "background"),
                         ("service.remove", "remove"),
                     ] {
                         let b = ui.button(t(key));
@@ -374,6 +444,10 @@ impl App {
             "rename" => {
                 self.sel_item = Some(ItemRef::Service(i));
                 self.open_rename_dialog();
+            }
+            "background" => {
+                let id = self.service.items[i].id.clone();
+                self.choose_background(super::backgrounds::BackgroundTarget::Item(id));
             }
             _ => {}
         }
@@ -498,6 +572,13 @@ impl App {
         if matches!(item.kind, ItemKind::Video(_)) {
             self.video_item_options(ui, item_ref);
         }
+        self.background_options(ui, item_ref);
+
+        // a bible passage: translations, languages, chapters and verses of the whole book
+        if matches!(item.kind, ItemKind::Bible(_)) && self.bible_item_panel(ui, item_ref) {
+            self.item_notes(ui, item_ref);
+            return;
+        }
 
         let slides = self.item_slides(&item);
         // jump buttons for marked parts
@@ -594,6 +675,11 @@ impl App {
             self.go_live();
         }
 
+        self.item_notes(ui, item_ref);
+    }
+
+    /// The notes of a service item (only for the operator).
+    fn item_notes(&mut self, ui: &mut egui::Ui, item_ref: ItemRef) {
         if let ItemRef::Service(i) = item_ref {
             ui.separator();
             ui.collapsing(t("service.notes"), |ui| {
@@ -617,7 +703,9 @@ impl App {
             if let Some((item, slide)) = self.live_pos
                 && let Some(it) = self.item(item)
             {
-                ui.weak(format!("{} — {}", it.title(), slide + 1));
+                // a long title is cut (whole on hover), it does not widen the column
+                let title = format!("{} — {}", it.title(), slide + 1);
+                ui.add(egui::Label::new(RichText::new(&title).weak()).truncate()).on_hover_text(title);
             }
         });
         if self.frozen.is_some() {
@@ -698,5 +786,45 @@ impl App {
                 ui.weak(format!("• {} ({})", c.display_name, c.addr));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::{fit_columns, panel_width};
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn chosen_widths_are_kept_when_they_fit() {
+        assert_eq!(fit_columns(1384.0, [270.0, 380.0]), [270.0, 380.0]);
+        // exactly enough room for both and the slides column
+        assert_eq!(fit_columns(850.0, [270.0, 380.0]), [270.0, 380.0]);
+    }
+
+    #[test]
+    fn a_narrow_window_shrinks_both_side_columns_in_the_same_ratio() {
+        // 784 wide: 584 for the side columns (200 stay for the slides), 650 wanted
+        let [l, r] = fit_columns(784.0, [270.0, 380.0]);
+        assert!(close(l, 270.0 * 584.0 / 650.0), "{l}");
+        assert!(close(r, 380.0 * 584.0 / 650.0), "{r}");
+        assert!(close(l + r, 584.0));
+        assert!(close(l / r, 270.0 / 380.0));
+        // no room at all (minimized): nothing, never negative
+        assert_eq!(fit_columns(100.0, [270.0, 380.0]), [0.0, 0.0]);
+        assert_eq!(fit_columns(0.0, [270.0, 380.0]), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn panel_width_is_what_egui_makes_of_it() {
+        assert_eq!(panel_width(300.0, 804.0, 1384.0), 300.0);
+        assert_eq!(panel_width(50.0, 804.0, 1384.0), 96.0, "egui's smallest panel");
+        assert_eq!(panel_width(2000.0, 804.0, 1384.0), 804.0, "the max size");
+        assert_eq!(panel_width(300.0, 96.0, 1384.0), 96.0);
+        assert_eq!(panel_width(300.0, 804.0, 50.0), 50.0, "never wider than the room");
+        assert_eq!(panel_width(30.0, 804.0, 50.0), 50.0);
+        assert_eq!(panel_width(300.0, 804.0, 0.0), 0.0);
     }
 }

@@ -78,6 +78,13 @@ pub struct Settings {
     /// The MCP server for code agents (on 127.0.0.1 only).
     pub mcp_enabled: bool,
     pub mcp_port: u16,
+    /// Which parts of a bible reference are shown on the slide.
+    pub bible_reference: crate::model::ReferenceParts,
+    /// Bible slides show their reference (songs and texts: `text_style.show_footer`).
+    /// Settings of older versions have one option for both: [`Settings::from_json`] copies it.
+    pub show_bible_reference: bool,
+    /// While the program runs, the computer does not go to sleep, blank or lock the screen.
+    pub prevent_sleep: bool,
 }
 
 impl Default for Settings {
@@ -99,7 +106,8 @@ impl Default for Settings {
             dark_mode: true,
             legacy_import_answered: false,
             bible_index_languages: Vec::new(),
-            output_always_on_top: false,
+            // the projector stays above other windows (and shows no mouse pointer)
+            output_always_on_top: true,
             output_on_second_screen: true,
             output_screen: None,
             alert_style: crate::model::AlertStyle::default(),
@@ -109,6 +117,9 @@ impl Default for Settings {
             guard_desktop_keys: true,
             mcp_enabled: false,
             mcp_port: crate::remote::mcp::DEFAULT_PORT,
+            bible_reference: crate::model::ReferenceParts::default(),
+            show_bible_reference: true,
+            prevent_sleep: true,
         }
     }
 }
@@ -116,7 +127,7 @@ impl Default for Settings {
 impl Settings {
     pub fn load() -> Self {
         let path = crate::storage::paths().settings_file();
-        let mut s: Settings = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut s = std::fs::read(&path).ok().and_then(|b| Self::from_json(&b)).unwrap_or_default();
         // make sure new built-in marks / actions appear after upgrades
         for d in SlideMark::defaults() {
             if !s.marks.iter().any(|m| m.code == d.code) {
@@ -125,6 +136,18 @@ impl Settings {
         }
         s.upgrade_shortcuts();
         s
+    }
+
+    /// Reads saved settings. Older versions had one "show the reference / song title" option
+    /// (`text_style.show_footer`) for bible and songs: bible slides keep what it said.
+    pub fn from_json(bytes: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let old_footer = v.get("show_bible_reference").is_none().then(|| v["text_style"]["show_footer"].as_bool()).flatten();
+        let mut s: Settings = serde_json::from_value(v).ok()?;
+        if let Some(show) = old_footer {
+            s.show_bible_reference = show;
+        }
+        Some(s)
     }
 
     /// New actions get their default keys; keys that were defaults of an older version and
